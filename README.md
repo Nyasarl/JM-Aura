@@ -55,6 +55,7 @@
 - **多账号管理**：每个影子账号可绑定多个 JM 账号，自由切换当前激活账号。
 - **网络与线路**：内置多域名容错机制，自动 failover；图片代理服务；域名可从 TOS 动态刷新。
 - **账号体系**：JM 登录/注册内置到设置页；登录成功后自动创建本地影子账号并保存会话（PBKDF2 加密，7 天有效期）。
+- **社区板块**：原「阅读笔记」升级为社区，帖子是**说说式无标题**内容，可点赞、可评论、可引用外链图片（不支持上传，最多 9 张）。填了作品 ID 的帖子保持原来的「漫画推荐」用法：卡片上显示作品条，点击回到详情页。点赞数 / 评论数 / 我是否点过赞都由服务端一次算好返回，前端只渲染与分页。
 - **备注**：为漫画添加标签和笔记。
 
 ## 技术栈
@@ -250,6 +251,7 @@ DATABASE_URL=postgresql://用户名:密码@127.0.0.1:5432/jm_aura
 | `site_sessions.json`        | 影子账号会话                            |
 | `site_profiles.json`        | 设置页资料与偏好                        |
 | `aura_library.json`         | Aura 历史 / 备注                        |
+| `recommendations.json`      | 社区帖子（说说正文、外链图片、点赞、评论；旧「阅读笔记」数据直接沿用，无需迁移） |
 | `jm.json`                   | JM 状态缓存（用户ID、资料、收藏）       |
 | `jmaura.db`                 | SQLite 数据库（下载任务记录）           |
 | `downloads/`                | 下载产物目录（ZIP 文件）                |
@@ -267,6 +269,16 @@ DATABASE_URL=postgresql://用户名:密码@127.0.0.1:5432/jm_aura
 
 所有 JSON 文件和数据库默认都放在数据目录下。
 
+## 💬 社区板块
+
+原「阅读笔记」已升级为**社区**（导航名「社区」，路由 `/community`，旧地址 `/recommend` 继续可用）。
+
+- **帖子是说说式的**：没有标题，正文支持换行；`comic_id` 选填——留空就是纯说说，填了就是原来的「推荐作品」，卡片上带作品条并保留回详情页的入口。
+- **图片只认外链**：不支持上传，服务端不接收、不落盘、不代理任何图片文件，只保存 http/https 链接（每条帖子最多 9 张，去重）。站内图片代理会按宽度重编码，对社区外链反而增加开销，所以帖子图片直接用原始链接渲染。
+- **互动**：点赞、评论。点赞 / 评论 / 发帖都需要登录（影子账号），删帖与删评论由作者本人或管理员（`JM_AURA_RECOMMEND_ADMIN`）执行，能否删除由服务端在响应里算好。
+- **性能约定**：点赞数、评论数、我是否点赞、评论作者昵称、可否删除全部在服务端一次算好；前端不做聚合、不做轮询，点赞只做一次乐观更新并由返回值校正，评论区**展开时才请求**并分页加载。
+- **数据兼容**：点赞 / 评论 / 图片都写在 `recommendations.json` 里（schema 超集），旧帖没有这些字段时按空处理，因此历史数据**不需要任何迁移**。
+
 ## 🏗️ 项目结构
 
 ```
@@ -283,6 +295,7 @@ JM-Aura/
 │       │   ├── dl.go           # 下载任务管理器 + 图片反 scrambling
 │       │   ├── site.go         # 影子账号登录/注册
 │       │   ├── aura.go         # Aura 历史/备注
+│       │   ├── community.go    # 社区：点赞 / 评论处理器
 │       │   ├── account.go      # JM 账号管理
 │       │   ├── proxy.go        # 图片代理
 │       │   ├── register.go     # JM 注册
@@ -297,6 +310,8 @@ JM-Aura/
 │           ├── cookies.go      # Cookie 持久化
 │           ├── jmstore.go      # JM 状态缓存
 │           ├── auralib.go      # Aura 历史/备注
+│           ├── recommend.go    # 社区帖子（说说 + 可选关联作品）
+│           ├── community.go    # 社区互动：图片链接、点赞、评论
 │           └── profiles.go     # 设置页资料
 ├── frontend-react/             # React 前端
 │   ├── package.json
@@ -335,6 +350,13 @@ JM-Aura/
 | GET    | `/api/afdian/sponsors`                 | 爱发电赞助者名单         |
 | GET    | `/api/afdian/binding`                  | 查询当前账号赞助绑定状态 |
 | POST   | `/api/afdian/binding`                  | 校验订单号并绑定（解锁无损下载） |
+| GET    | `/api/recommend`                       | 社区帖子列表（说说式，按时间倒序分页；含点赞数/评论数/我是否点赞/可否删除） |
+| POST   | `/api/recommend`                       | 发帖（`comic_id` 选填，填了即「推荐作品」；`images` 为外链图片，最多 9 张） |
+| DELETE | `/api/recommend/{id}`                  | 删帖（作者本人或管理员） |
+| POST   | `/api/recommend/{id}/like`             | 点赞 / 取消点赞（登录用户，返回 `liked` + `like_count`） |
+| GET    | `/api/recommend/{id}/comments`         | 评论列表（公开，倒序分页） |
+| POST   | `/api/recommend/{id}/comments`         | 发表评论（登录用户）     |
+| DELETE | `/api/recommend/comments/{id}`         | 删除评论（作者本人或管理员） |
 | ...    | ...                                    | 完整列表见 router.go     |
 
 </details>

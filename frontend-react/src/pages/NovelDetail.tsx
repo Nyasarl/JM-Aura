@@ -646,7 +646,7 @@ export default function NovelDetail() {
         onClose={() => setRecommendOpen(false)}
         defaultComicId={novelId}
         defaultKind="novel"
-        onPosted={() => toast('发布成功，可在「阅读笔记」页查看')}
+        onPosted={() => toast('发布成功，可在「社区」页查看')}
       />
     </Box>
   )

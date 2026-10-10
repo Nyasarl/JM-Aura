@@ -79,25 +79,32 @@ func normalizeRecommendSource(source string) string {
 // the target is a comic or a novel; source marks which upstream it belongs to.
 // coverURL is an optional resolved cover snapshot: bika covers cannot be derived
 // from the id alone, so they are persisted here.
-func RecommendCreate(author, comicID, title, kind, body, source, coverURL string) (map[string]any, error) {
+//
+// comicID may be empty: the board also takes plain 说说-style posts that
+// recommend no work at all, as long as they carry text or an image link.
+// images are external http/https links only (uploads are not supported); they are
+// validated, de-duplicated and capped here as a last line of defence.
+func RecommendCreate(author, comicID, title, kind, body, source, coverURL string, images []string) (map[string]any, error) {
 	a := strings.TrimSpace(author)
 	if a == "" {
 		return nil, errors.New("Not authenticated")
 	}
 	cid := strings.TrimSpace(comicID)
-	if cid == "" {
-		return nil, errors.New("Missing comic_id")
-	}
+	imgs := normalizeImageLinks(images)
 	t := []rune(strings.TrimSpace(title))
 	if len(t) > recommendMaxTitle {
 		t = t[:recommendMaxTitle]
 	}
 	b := []rune(strings.TrimSpace(body))
-	if len(b) == 0 {
+	if len(b) == 0 && len(imgs) == 0 {
 		return nil, errors.New("Missing content")
 	}
 	if len(b) > RecommendMaxBody {
 		b = b[:RecommendMaxBody]
+	}
+	if cid == "" {
+		// Pure status post: there is no work behind it, so no content title either.
+		t = nil
 	}
 	doc := loadRecommendDoc()
 	posts := recommendPosts(doc)
@@ -111,6 +118,9 @@ func RecommendCreate(author, comicID, title, kind, body, source, coverURL string
 		"author":      a,
 		"created_at":  nowMS(),
 	}
+	if len(imgs) > 0 {
+		post["images"] = imgs
+	}
 	if cov := strings.TrimSpace(coverURL); cov != "" {
 		post["cover_url"] = cov
 	}
@@ -123,8 +133,11 @@ func RecommendCreate(author, comicID, title, kind, body, source, coverURL string
 	return post, nil
 }
 
-// RecommendList returns posts sorted by created_at desc, paginated.
-func RecommendList(page, pageSize int) map[string]any {
+// RecommendList returns posts sorted by created_at desc, paginated. viewer is the
+// plain site user id (may be empty) and only drives the per-post liked_by_me flag;
+// like/comment counts are computed here so the browser renders them without any
+// client-side aggregation.
+func RecommendList(page, pageSize int, viewer string) map[string]any {
 	if page < 1 {
 		page = 1
 	}
@@ -156,16 +169,21 @@ func RecommendList(page, pageSize int) map[string]any {
 	}
 	items := make([]map[string]any, 0, end-start)
 	for _, m := range list[start:end] {
+		likes, comments, likedByMe := RecommendPostStats(m, viewer)
 		items = append(items, map[string]any{
-			"id":          getStr(m, "id"),
-			"comic_id":    getStr(m, "comic_id"),
-			"comic_title": getStr(m, "comic_title"),
-			"kind":        normalizeRecommendKind(getStr(m, "kind")),
-			"source":      normalizeRecommendSource(getStr(m, "source")),
-			"body":        getStr(m, "body"),
-			"author":      getStr(m, "author"),
-			"created_at":  int64(numF(m["created_at"])),
-			"cover_url":   getStr(m, "cover_url"),
+			"id":            getStr(m, "id"),
+			"comic_id":      getStr(m, "comic_id"),
+			"comic_title":   getStr(m, "comic_title"),
+			"kind":          normalizeRecommendKind(getStr(m, "kind")),
+			"source":        normalizeRecommendSource(getStr(m, "source")),
+			"body":          getStr(m, "body"),
+			"author":        getStr(m, "author"),
+			"created_at":    int64(numF(m["created_at"])),
+			"cover_url":     getStr(m, "cover_url"),
+			"images":        RecommendImageURLs(m["images"]),
+			"like_count":    likes,
+			"comment_count": comments,
+			"liked_by_me":   likedByMe,
 		})
 	}
 	return map[string]any{

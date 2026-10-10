@@ -11,9 +11,15 @@ var (
 	muData   sync.Mutex
 	dataDir  string
 	onceData sync.Once
+	// dataDirOverride, when set through SetDataDir, wins over the environment and
+	// over the directory sniffing below. Tests use it to stay inside a temp dir.
+	dataDirOverride string
 )
 
 func DataDir() string {
+	if v := dataDirOverride; v != "" {
+		return v
+	}
 	onceData.Do(func() {
 		if v := os.Getenv("JM_AURA_DATA_DIR"); v != "" {
 			dataDir = v
@@ -28,6 +34,18 @@ func DataDir() string {
 		dataDir = "config"
 	})
 	return dataDir
+}
+
+// SetDataDir pins the data directory for the rest of the process. It exists for
+// tests, which must never write into a real config directory; production code
+// configures JM_AURA_DATA_DIR instead.
+func SetDataDir(dir string) {
+	muData.Lock()
+	defer muData.Unlock()
+	dataDirOverride = dir
+	dataDir = dir
+	onceData = sync.Once{}
+	onceData.Do(func() {}) // mark the once as already fired
 }
 
 func Path(rel string) string {

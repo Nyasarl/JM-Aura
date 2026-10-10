@@ -167,7 +167,7 @@ func handleRecommendList(w http.ResponseWriter, r *http.Request) {
 	}
 	me := plainSiteUserOf(r)
 	moderator := isRecommendAdmin(me)
-	data := store.RecommendList(page, size)
+	data := store.RecommendList(page, size, me)
 	raw, _ := data["items"].([]map[string]any)
 	nicks := store.JmNicknames()
 	items := make([]map[string]any, 0, len(raw))
@@ -183,21 +183,26 @@ func handleRecommendList(w http.ResponseWriter, r *http.Request) {
 			source = "jm"
 		}
 		cover, _ := it["cover_url"].(string)
-		if strings.TrimSpace(cover) == "" {
+		if strings.TrimSpace(cover) == "" && cid != "" {
+			// A work-less 说说帖 has nothing to derive a cover from.
 			cover = recommendCoverURL(source, kind, cid)
 		}
 		items = append(items, map[string]any{
-			"id":          it["id"],
-			"comic_id":    cid,
-			"comic_title": it["comic_title"],
-			"kind":        kind,
-			"source":      source,
-			"body":        it["body"],
-			"author":      author,
-			"author_name": recommendDisplayName(nicks, author),
-			"created_at":  it["created_at"],
-			"cover_url":   cover,
-			"can_delete":  moderator || (me != "" && author == me),
+			"id":            it["id"],
+			"comic_id":      cid,
+			"comic_title":   it["comic_title"],
+			"kind":          kind,
+			"source":        source,
+			"body":          it["body"],
+			"author":        author,
+			"author_name":   recommendDisplayName(nicks, author),
+			"created_at":    it["created_at"],
+			"cover_url":     cover,
+			"images":        it["images"],
+			"like_count":    it["like_count"],
+			"comment_count": it["comment_count"],
+			"liked_by_me":   it["liked_by_me"],
+			"can_delete":    moderator || (me != "" && author == me),
 		})
 	}
 	writeJSON(w, 200, ok(map[string]any{
@@ -220,39 +225,56 @@ func handleRecommendCreate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req struct {
-		ComicID string `json:"comic_id"`
-		Kind    string `json:"kind"`
-		Source  string `json:"source"`
-		Body    string `json:"body"`
+		ComicID string   `json:"comic_id"`
+		Kind    string   `json:"kind"`
+		Source  string   `json:"source"`
+		Body    string   `json:"body"`
+		Images  []string `json:"images"`
 	}
 	_ = json.NewDecoder(r.Body).Decode(&req)
 	source := "jm"
 	if strings.EqualFold(strings.TrimSpace(req.Source), bikaSource) {
 		source = bikaSource
 	}
-	if !validRecommendID(source, req.ComicID) {
-		writeJSON(w, 200, errSt(StatusUserError, "Invalid comic_id"))
+	images, err := communityImages(req.Images)
+	if err != nil {
+		writeJSON(w, 200, errSt(StatusUserError, err.Error()))
 		return
 	}
+	comicID := strings.TrimSpace(req.ComicID)
 	var kind, title, cover string
-	if source == bikaSource {
-		// 哔咔只有漫画，类型固定为 comic；标题 / 封面按该源身份解析。
-		kind = "comic"
-		title, cover = recommendTargetBika(r.Context(), effIdentityFor(r, source), req.ComicID)
+	if comicID != "" {
+		if !validRecommendID(source, comicID) {
+			writeJSON(w, 200, errSt(StatusUserError, "Invalid comic_id"))
+			return
+		}
+		if source == bikaSource {
+			// 哔咔只有漫画，类型固定为 comic；标题 / 封面按该源身份解析。
+			kind = "comic"
+			title, cover = recommendTargetBika(r.Context(), effIdentityFor(r, source), comicID)
+		} else {
+			kind, title = recommendTargetOfKind(r.Context(), effIdentityOf(r), comicID, req.Kind)
+		}
 	} else {
-		kind, title = recommendTargetOfKind(r.Context(), effIdentityOf(r), req.ComicID, req.Kind)
+		// 纯说说帖：没有关联作品，类型只用于兜底展示。
+		kind = "comic"
 	}
-	post, err := store.RecommendCreate(u, req.ComicID, title, kind, req.Body, source, cover)
+	post, err := store.RecommendCreate(u, comicID, title, kind, req.Body, source, cover, images)
 	if err != nil {
 		writeJSON(w, 200, errSt(StatusUserError, err.Error()))
 		return
 	}
 	cid, _ := post["comic_id"].(string)
-	if cov, _ := post["cover_url"].(string); strings.TrimSpace(cov) == "" {
+	if cov, _ := post["cover_url"].(string); strings.TrimSpace(cov) == "" && cid != "" {
 		post["cover_url"] = recommendCoverURL(source, kind, cid)
 	}
 	post["source"] = source
 	post["author_name"] = recommendDisplayName(store.JmNicknames(), u)
+	post["images"] = store.RecommendImageURLs(post["images"])
+	post["like_count"] = 0
+	post["comment_count"] = 0
+	post["liked_by_me"] = false
+	post["can_delete"] = true
 	writeJSON(w, 200, ok(map[string]any{"status": "success", "post": post}, ""))
 }
 

@@ -42,7 +42,7 @@ import SettingsIcon from '@mui/icons-material/Settings'
 import ShuffleIcon from '@mui/icons-material/Shuffle'
 import StarIcon from '@mui/icons-material/Star'
 import SwipeVerticalIcon from '@mui/icons-material/SwipeVertical'
-import ThumbUpAltOutlinedIcon from '@mui/icons-material/ThumbUpAltOutlined'
+import ForumOutlinedIcon from '@mui/icons-material/ForumOutlined'
 import VolunteerActivismIcon from '@mui/icons-material/VolunteerActivism'
 import WhatshotIcon from '@mui/icons-material/Whatshot'
 import { useAuth } from './auth'
@@ -69,7 +69,7 @@ const Leaderboard = lazy(() => import('./pages/Leaderboard'))
 const Daily = lazy(() => import('./pages/Daily'))
 const Latest = lazy(() => import('./pages/Latest'))
 const RandomPage = lazy(() => import('./pages/RandomPage'))
-const Recommend = lazy(() => import('./pages/Recommend'))
+const Community = lazy(() => import('./pages/Community'))
 const ComicDetail = lazy(() => import('./pages/ComicDetail'))
 const Reader = lazy(() => import('./pages/Reader'))
 const Favorites = lazy(() => import('./pages/Favorites'))
@@ -90,7 +90,9 @@ const JM_PAGES: Array<[string, ReactNode]> = [
   ['leaderboard', <Leaderboard />],
   ['latest', <Latest />],
   ['random', <RandomPage />],
-  ['recommend', <Recommend />],
+  ['community', <Community />],
+  // 旧链接「阅读笔记」继续可用，指向同一个社区板块。
+  ['recommend', <Community />],
   ['comic/:comicId', <ComicDetail />],
   ['reader/:chapterId', <Reader />],
   ['novels', <NovelList />],
@@ -139,7 +141,7 @@ const NAV_BROWSE: NavItem[] = [
   { to: '/leaderboard', label: '排行榜', icon: <WhatshotIcon /> },
   { to: '/latest', label: '最新', icon: <SwipeVerticalIcon /> },
   { to: '/random', label: '随机', icon: <ShuffleIcon /> },
-  { to: '/recommend', label: '阅读笔记', icon: <ThumbUpAltOutlinedIcon /> },
+  { to: '/community', label: '社区', icon: <ForumOutlinedIcon /> },
 ]
 
 const NAV_MINE: NavItem[] = [
@@ -150,10 +152,10 @@ const NAV_MINE: NavItem[] = [
   { to: '/about', label: '关于', icon: <InfoOutlinedIcon /> },
 ]
 
-// bika 源没有小说，也没有 JM 专有的 legacy「最新」流，导航按源裁剪。
+// bika 源没有小说，也没有 JM 专有的 legacy「最新」流；社区板块同样只在 JM 下挂载。
 const NAV_SOURCE_HIDDEN: Record<SourceKind, Set<string>> = {
   jm: new Set<string>(),
-  bika: new Set<string>(['/novels', '/latest']),
+  bika: new Set<string>(['/novels', '/latest', '/community']),
 }
 
 function navBrowseFor(kind: SourceKind): NavItem[] {

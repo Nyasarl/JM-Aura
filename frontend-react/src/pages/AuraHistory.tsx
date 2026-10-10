@@ -1,6 +1,6 @@
 // 阅读历史：GET /api/aura/library/history?limit=N
 // 记录形状：{album_id, album_title, photo_id, title, page_index, timestamp, type, scroll_pct}
-// 笔记已整合到「阅读笔记」页（发布后直接进入社区列表）。
+// 笔记已整合到「社区」页（发布后直接进入社区列表）。
 import { Link as RouterLink } from 'react-router-dom'
 import Box from '@mui/material/Box'
 import Button from '@mui/material/Button'

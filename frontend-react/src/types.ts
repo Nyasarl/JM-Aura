@@ -128,13 +128,14 @@ export interface SiteMe {
   is_admin: boolean
 }
 
-// ── 阅读笔记（app/recommend.go 响应结构对齐） ──
+// ── 社区（原「阅读笔记」，app/recommend.go 响应结构对齐） ──
 
 /** 作品类型：后端自动识别，决定封面目录与详情页跳转。 */
 export type WorkKind = 'comic' | 'novel'
 
 export interface Recommendation {
   id: string
+  /** 关联作品 id；纯说说帖为空字符串。 */
   comic_id: string
   comic_title: string
   kind: WorkKind
@@ -145,6 +146,11 @@ export interface Recommendation {
   author_name: string
   created_at: number
   cover_url: string
+  /** 帖子引用的外链图片（服务端只存链接，不接受上传）；老数据缺省为空数组。 */
+  images: string[]
+  like_count: number
+  comment_count: number
+  liked_by_me: boolean
   can_delete: boolean
 }
 
@@ -155,6 +161,24 @@ export interface RecommendationList {
   page_size: number
   has_more: boolean
   is_moderator: boolean
+}
+
+/** 一条帖子评论。 */
+export interface RecommendComment {
+  id: string
+  body: string
+  author: string
+  author_name: string
+  created_at: number
+  can_delete: boolean
+}
+
+export interface RecommendCommentList {
+  items: RecommendComment[]
+  total: number
+  page: number
+  page_size: number
+  has_more: boolean
 }
 
 export interface V2Comment {

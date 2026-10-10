@@ -78,9 +78,10 @@ export function logicalPathOf(pathname: string = window.location.pathname): stri
   return rest === '' ? '/' : rest
 }
 
-/** bika 源不支持的逻辑路径（没有小说，也没有 JM 专有的 legacy「最新」流）。 */
+/** bika 源不支持的逻辑路径（没有小说，也没有 JM 专有的 legacy「最新」流与社区板块）。 */
 export function bikaSupportsLogical(logical: string): boolean {
   if (logical === '/latest' || logical === '/novels') return false
+  if (logical === '/community' || logical === '/recommend') return false
   if (logical.startsWith('/novel/') || logical.startsWith('/novel_reader/')) return false
   return true
 }

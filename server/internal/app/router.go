@@ -32,6 +32,10 @@ func NewRouter() *http.ServeMux {
 	route(mux, http.MethodGet, "/api/recommend", handleRecommendList)
 	route(mux, http.MethodPost, "/api/recommend", handleRecommendCreate)
 	route(mux, http.MethodDelete, "/api/recommend/{id}", handleRecommendDelete)
+	route(mux, http.MethodPost, "/api/recommend/{id}/like", handleRecommendLike)
+	route(mux, http.MethodGet, "/api/recommend/{id}/comments", handleRecommendComments)
+	route(mux, http.MethodPost, "/api/recommend/{id}/comments", handleRecommendCommentCreate)
+	route(mux, http.MethodDelete, "/api/recommend/comments/{id}", handleRecommendCommentDelete)
 
 	route(mux, http.MethodPost, "/api/config", handleConfigPost)
 	route(mux, http.MethodGet, "/api/config", handleConfigGet)
