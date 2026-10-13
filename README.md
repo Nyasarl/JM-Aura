@@ -218,6 +218,36 @@ npm run dev
 | `JM_AURA_AFDIAN_BINDINGS_PATH` | 爱发电赞助绑定文件                         | `DataDir/afdian_bindings.json` |
 | `JM_AURA_DL_CONCURRENCY`       | 下载/导出同时执行的任务数（2 核机器建议保持 1；上限 4） | `1`                     |
 | `JM_AURA_DL_MAX_QUEUED`        | 单账号同时排队的下载/导出任务上限（防误刷，非永久拒绝） | `10`                    |
+| `JM_AURA_API_CACHE`            | 上游只读接口响应缓存总开关（`off`/`0`/`false` 关闭） | 开                       |
+| `JM_AURA_API_CACHE_BYTES`      | 上游响应缓存体量上限（字节）               | `67108864`（64 MiB）      |
+| `JM_AURA_API_CACHE_TTL_SCALE`  | 缓存 TTL 整体缩放倍数；`0` 等于关掉缓存    | `1`                      |
+| `JM_AURA_API_DOMAIN_TIMEOUT`   | 单个上游域名一次尝试的超时（需带单位，如 `6s`） | `8s`                 |
+
+### 上游缓存与吞吐
+
+JM 的 API 本身偏慢（实测 `/search` 冷启动约 2.5s、`/album` 在 1.2s~6.2s 之间抖动、
+`/chapter` 约 0.9s），而同一本热门作品会被几十上百人同时打开。服务端因此做了三件事：
+
+1. **只读接口响应缓存 + single-flight**：`/categories`、`/album`、`/chapter`、`/search`
+   等 GET 接口的响应按 `method + path + query + 凭证指纹` 缓存，命中直接返回；
+   未命中时同一瞬间的相同请求会合并成一次上游调用（游客不带 cookie，共享同一个
+   缓存桶，因此命中率最高；登录用户之间则按用户隔离）。
+2. **传输层调优**：显式开启 HTTP/2（Go 只要看到自定义 `DialContext`/`TLSClientConfig`
+   就会保守地关掉 h2）、把每域名空闲连接数提到 48，并在启动时预热各上游域名。
+3. **章节图抓取加固**：任意候选图床的网络错误/超时/非 200 都会继续尝试下一个域名
+   （以前首个域名连不上就直接裂图），同一张图的并发请求会合并成一次上游抓取，
+   并给整条链路加了整体超时。
+
+可用 `GET /api/v2/cache/stats` 观察实际效果：
+
+```bash
+curl -s localhost:8000/api/v2/cache/stats | jq .data.upstream_api
+# { "enabled": true, "entries": 128, "hits": 5231, "misses": 431,
+#   "upstream_calls": 402, "coalesced": 29, "hit_rate": 0.9239, ... }
+```
+
+`upstream_calls` 是真实打到上游的 API 次数（`misses` 只表示缓存没命中），
+用它除以总请求数即可看出上游压力下降了多少。
 
 ### DATABASE_URL 连接串示例
 
@@ -357,6 +387,8 @@ JM-Aura/
 | GET    | `/api/recommend/{id}/comments`         | 评论列表（公开，倒序分页） |
 | POST   | `/api/recommend/{id}/comments`         | 发表评论（登录用户）     |
 | DELETE | `/api/recommend/comments/{id}`         | 删除评论（作者本人或管理员） |
+| GET    | `/api/v2/cache/stats`                  | 上游响应缓存/章节图缓存统计（命中率、上游调用数、占用） |
+| POST   | `/api/v2/cache/cleanup`                | 清理下载缓存目录         |
 | ...    | ...                                    | 完整列表见 router.go     |
 
 </details>
@@ -365,6 +397,11 @@ JM-Aura/
 
 **Q: 页面能打开，但图片不显示/加载慢？**
 先多刷新几次，确保服务器能正常访问外网。JM Client 内置多域名容错，会自动 failover；必要时可重启服务触发域名刷新。
+
+**Q: 怎么确认上游缓存真的在起作用？**
+`curl -s localhost:8000/api/v2/cache/stats | jq .data.upstream_api`，看 `hit_rate` 与
+`upstream_calls`。如果 `hit_rate` 长期很低，先确认请求里带的 cookie 是否稳定
+（每个游客都带一份不同的 cookie 会让缓存按用户分裂）。
 
 **Q: 评论发不出去？**
 上游有风控，请避免过短/重复内容，稍等再发。

@@ -1443,6 +1443,34 @@ func handleV2CacheCleanup(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, ok(map[string]any{"removed_dirs": dirs, "removed_work": work}, ""))
 }
 
+// handleV2CacheStats 暴露上游响应缓存与章节图解码缓存的运行数据，
+// 用于确认优化是否真的生效（命中率、被合并的请求数、占用等）。
+func handleV2CacheStats(w http.ResponseWriter, r *http.Request) {
+	imgEntries, imgBytes := imgDecoded.stats()
+	upstream := jm.SharedAPICacheStats()
+	writeJSON(w, 200, ok(map[string]any{
+		"upstream_api": map[string]any{
+			"enabled":            upstream.Enabled,
+			"entries":            upstream.Entries,
+			"bytes":              upstream.Bytes,
+			"max_bytes":          upstream.MaxBytes,
+			"hits":               upstream.Hits,
+			"misses":             upstream.Misses,
+			"upstream_calls":     upstream.UpstreamCalls,
+			"expired":            upstream.Expired,
+			"coalesced":          upstream.Coalesced,
+			"evicted":            upstream.Evicted,
+			"rejected_too_large": upstream.Rejected,
+			"errors_cached":      upstream.ErrorsCached,
+			"hit_rate":           upstream.HitRate,
+		},
+		"chapter_images_decoded": map[string]any{
+			"entries": imgEntries,
+			"bytes":   imgBytes,
+		},
+	}, ""))
+}
+
 type v2NovelSummary struct {
 	Source   string         `json:"source"`
 	NovelID  string         `json:"novel_id"`

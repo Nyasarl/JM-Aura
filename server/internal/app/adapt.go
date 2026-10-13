@@ -1,6 +1,7 @@
 package app
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"math"
@@ -15,6 +16,12 @@ import (
 var defaultClient = jm.NewClient()
 
 func apiClient() *jm.Client { return defaultClient }
+
+// WarmupUpstream 预热与上游（API + 图床）的连接，避免冷启动后第一批请求
+// 全部付出 TCP/TLS 握手成本。调用方通常放在后台 goroutine 里执行。
+func WarmupUpstream(ctx context.Context) {
+	defaultClient.Warmup(ctx)
+}
 
 func imgBase() string {
 	ds := defaultClient.ImageDomains()

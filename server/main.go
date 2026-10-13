@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"log"
 	"net"
 	"net/http"
@@ -38,6 +39,19 @@ func main() {
 	port := envOr("JM_AURA_PORT", envOr("PORT", "8000"))
 	addr := host + ":" + port
 	log.Printf("JM-Aura server listening on http://%s", addr)
+
+	// 后台预热与上游的连接（API + 图床各一次），让冷启动后的第一批请求
+	// 不必逐个付出 TCP/TLS 握手成本。失败只记日志，不影响服务可用性。
+	go func() {
+		defer func() {
+			if rec := recover(); rec != nil {
+				log.Printf("预热上游连接时出错: %v", rec)
+			}
+		}()
+		app.WarmupUpstream(context.Background())
+		log.Printf("上游连接预热完成")
+	}()
+
 	if err := http.ListenAndServe(addr, app.Wrap(app.NewRouter())); err != nil {
 		log.Fatal(err)
 	}

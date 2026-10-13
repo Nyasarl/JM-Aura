@@ -5,6 +5,8 @@ import (
 	"container/list"
 	"context"
 	"crypto/tls"
+	"errors"
+	"fmt"
 	"image"
 	_ "image/gif"
 	"image/jpeg"
@@ -33,10 +35,19 @@ func newProxyClient(verify bool) *http.Client {
 	return &http.Client{
 		Transport: &http.Transport{
 			Proxy:                 http.ProxyFromEnvironment,
-			DialContext:           (&net.Dialer{Timeout: 15 * time.Second, KeepAlive: 30 * time.Second}).DialContext,
-			TLSHandshakeTimeout:   15 * time.Second,
+			DialContext:           (&net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second}).DialContext,
+			TLSHandshakeTimeout:   10 * time.Second,
 			ResponseHeaderTimeout: 15 * time.Second,
-			MaxIdleConnsPerHost:   8,
+			// 图床是 HTTPS 且支持 HTTP/2；Go 只要看到 DialContext/TLSClientConfig
+			// 被显式设置就保守地关掉 h2，必须显式兜回来。否则 200 并发下会退化
+			// 成一堆新连接 + 握手（多花 1~2 个 RTT，还吃本机 CPU/TIME_WAIT）。
+			ForceAttemptHTTP2: true,
+			// 池子要能撑住"同一份热门章节被几十上百人同时打开"的并发，否则
+			// MaxIdleConnsPerHost 太小会退化成反复握手。
+			MaxIdleConns:          256,
+			MaxIdleConnsPerHost:   64,
+			IdleConnTimeout:       90 * time.Second,
+			ExpectContinueTimeout: 1 * time.Second,
 			TLSClientConfig:       &tls.Config{InsecureSkipVerify: !verify},
 		},
 	}
@@ -87,6 +98,13 @@ type imgThumbCache struct {
 	items map[string]*list.Element
 	bytes int
 	max   int
+}
+
+// stats 返回当前缓存条目数与占用字节数（供 /api/v2/cache/stats 观察）。
+func (c *imgThumbCache) stats() (int, int) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return len(c.items), c.bytes
 }
 
 var imgThumbs = &imgThumbCache{order: list.New(), items: map[string]*list.Element{}, max: imgThumbMaxBytes}
@@ -345,6 +363,9 @@ func writeChapterImage(w http.ResponseWriter, ct string, data []byte) {
 	}
 	w.Header().Set("Content-Type", ct)
 	w.Header().Set("Cache-Control", "public, max-age=31536000")
+	// 显式给出长度：否则 Go 只能分块传输（chunked），浏览器无法显示进度，
+	// 中间层也没法按长度调度。
+	w.Header().Set("Content-Length", strconv.Itoa(len(data)))
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write(data)
 }
@@ -376,15 +397,77 @@ func handleChapterImage(w http.ResponseWriter, r *http.Request) {
 		!strings.HasSuffix(strings.ToLower(imageName), ".gif") &&
 		dlSegmentationNum(epsID, scrambleID, picName) > 1
 
-	cacheKey := ""
 	if wantDecode {
-		cacheKey = strconv.Itoa(scrambleID) + "|" + photoID + "|" + imageName
-		if data, ct, hit := imgDecoded.get(cacheKey); hit {
+		if data, ct, hit := imgDecoded.get(chapterImageDecodeKey(scrambleID, photoID, imageName)); hit {
 			writeChapterImage(w, ct, data)
 			return
 		}
 	}
 
+	candidates := chapterImageCandidates(domain)
+
+	// 整体超时：以前只有「响应头超时」和调用方断线，body 读到一半卡死会一直挂着。
+	ctx, cancel := context.WithTimeout(r.Context(), chapterImageTimeout)
+	defer cancel()
+
+	// 「同一 URL 并发合并」：热门章节被几十上百人同时打开时，以前每个请求都会各自
+	// 打一次图床（再各自解码一次），现在是同一张图只抓一次，其余请求复用同一份字节。
+	res := chapterImageFetchMerged(ctx, chapterImageFlightKey(photoID, imageName), func(fctx context.Context) imgFetchResult {
+		return fetchChapterImageRaw(fctx, candidates, photoID, imageName)
+	})
+
+	if errors.Is(res.err, errImageTooLarge) {
+		// 超过缓冲上限的少数大图：退化为直接流式转发，不做合并。
+		streamChapterImageDirect(w, ctx, candidates, photoID, imageName)
+		return
+	}
+	if res.err != nil {
+		status := res.status
+		if status == 0 {
+			status = http.StatusBadGateway
+		}
+		httpDetail(w, status, "Image not found")
+		return
+	}
+
+	if !wantDecode {
+		writeChapterImage(w, res.ct, res.body)
+		return
+	}
+	if out, ct, ok := decodeChapterImage(ctx, res.body, epsID, scrambleID, picName); ok {
+		imgDecoded.put(chapterImageDecodeKey(scrambleID, photoID, imageName), out, ct)
+		writeChapterImage(w, ct, out)
+		return
+	}
+	// 解码失败（格式不支持/图片损坏）：原样回发，避免整页空白。
+	writeChapterImage(w, http.DetectContentType(res.body), res.body)
+}
+
+// ── 章节图抓取：候选域名、超时、并发合并 ──────────────────────────────────────
+
+const (
+	// imgFetchMaxBody 是「可被合并复用」的单张图片字节上限。真实章节图（webp/jpeg）
+	// 通常只有几十 KB 到 1 MB，这里给足余量，同时避免极端输入把内存吃光。
+	imgFetchMaxBody = 12 << 20
+	// chapterImageTimeout 是一次章节图抓取（含故障转移）的总预算。
+	chapterImageTimeout = 25 * time.Second
+)
+
+// errImageTooLarge 表示图片超过合并缓冲上限，调用方应退化为直接流式转发。
+var errImageTooLarge = errors.New("chapter image too large to buffer")
+
+// chapterImageDecodeKey 是解码结果的缓存键。
+func chapterImageDecodeKey(scrambleID int, photoID, imageName string) string {
+	return strconv.Itoa(scrambleID) + "|" + photoID + "|" + imageName
+}
+
+// chapterImageFlightKey 是并发合并的键：同一张图（同图床路径）只抓一次。
+func chapterImageFlightKey(photoID, imageName string) string {
+	return photoID + "|" + imageName
+}
+
+// chapterImageCandidates 返回按优先级排列的候选图床域名。
+func chapterImageCandidates(domain string) []string {
 	candidates := []string{}
 	dv := domain
 	if dv != "" && !strings.Contains(dv, ":") && !strings.Contains(dv, "localhost") &&
@@ -399,7 +482,112 @@ func handleChapterImage(w http.ResponseWriter, r *http.Request) {
 	if len(candidates) == 0 {
 		candidates = append(candidates, "cdn-msp.jmapinodeudzn.net")
 	}
+	return candidates
+}
 
+type imgFetchResult struct {
+	body   []byte
+	ct     string
+	status int
+	err    error
+}
+
+type imgFlight struct {
+	done chan struct{}
+	res  imgFetchResult
+}
+
+var chapterImageFlights = struct {
+	mu sync.Mutex
+	m  map[string]*imgFlight
+}{m: map[string]*imgFlight{}}
+
+// chapterImageFetchMerged 保证同一 key 的并发请求只执行一次 fetch，其余等待结果。
+func chapterImageFetchMerged(ctx context.Context, key string, fetch func(context.Context) imgFetchResult) imgFetchResult {
+	chapterImageFlights.mu.Lock()
+	if f, ok := chapterImageFlights.m[key]; ok {
+		chapterImageFlights.mu.Unlock()
+		select {
+		case <-f.done:
+			return f.res
+		case <-ctx.Done():
+			return imgFetchResult{err: ctx.Err()}
+		}
+	}
+	f := &imgFlight{done: make(chan struct{})}
+	chapterImageFlights.m[key] = f
+	chapterImageFlights.mu.Unlock()
+
+	// 首位请求方用自己的 ctx 去抓；但如果它中途断线，不能让同一批等待者也失败，
+	// 所以这里脱掉取消信号，只保留整体超时。
+	fctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), chapterImageTimeout)
+	res := fetch(fctx)
+	cancel()
+
+	f.res = res
+	chapterImageFlights.mu.Lock()
+	delete(chapterImageFlights.m, key)
+	chapterImageFlights.mu.Unlock()
+	close(f.done)
+	return res
+}
+
+// fetchChapterImageRaw 抓取一张章节图：任何一个候选域名的网络错误、超时或非 200
+// 都会换下一个域名继续试（修复以前「首个域名致命错误就直接 500 裂图」的问题）。
+func fetchChapterImageRaw(ctx context.Context, candidates []string, photoID, imageName string) imgFetchResult {
+	seen := map[string]bool{}
+	lastErr := error(nil)
+	lastStatus := 0
+	for _, host := range candidates {
+		if seen[host] {
+			continue
+		}
+		seen[host] = true
+
+		imgURL := "https://" + host + "/media/photos/" + photoID + "/" + imageName
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, imgURL, nil)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		req.Header.Set("Referer", "https://"+host+"/")
+		req.Header.Set("User-Agent", chrome120UA)
+
+		resp, err := proxyClientNoVerify.Do(req)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		lastStatus = resp.StatusCode
+		if resp.StatusCode != http.StatusOK {
+			_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4<<10))
+			_ = resp.Body.Close()
+			lastErr = fmt.Errorf("chapter image: HTTP %d from %s", resp.StatusCode, host)
+			continue
+		}
+		ct := resp.Header.Get("Content-Type")
+		body, rerr := io.ReadAll(io.LimitReader(resp.Body, imgFetchMaxBody+1))
+		_ = resp.Body.Close()
+		if rerr != nil {
+			lastErr = rerr
+			continue
+		}
+		if int64(len(body)) > imgFetchMaxBody {
+			return imgFetchResult{status: http.StatusOK, err: errImageTooLarge}
+		}
+		if ct == "" {
+			ct = http.DetectContentType(body)
+		}
+		return imgFetchResult{body: body, ct: ct, status: http.StatusOK}
+	}
+	if lastErr == nil {
+		lastErr = errors.New("chapter image: no candidate host available")
+	}
+	return imgFetchResult{status: lastStatus, err: lastErr}
+}
+
+// streamChapterImageDirect 是超出缓冲上限时的退路：直接边读边转发，不经过内存缓冲。
+func streamChapterImageDirect(w http.ResponseWriter, ctx context.Context, candidates []string, photoID, imageName string) {
 	seen := map[string]bool{}
 	lastStatus := 0
 	for _, host := range candidates {
@@ -408,46 +596,27 @@ func handleChapterImage(w http.ResponseWriter, r *http.Request) {
 		}
 		seen[host] = true
 		imgURL := "https://" + host + "/media/photos/" + photoID + "/" + imageName
-		req, rerr := http.NewRequestWithContext(r.Context(), http.MethodGet, imgURL, nil)
-		if rerr != nil {
-			httpDetail(w, 500, rerr.Error())
-			return
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, imgURL, nil)
+		if err != nil {
+			continue
 		}
 		req.Header.Set("Referer", "https://"+host+"/")
 		req.Header.Set("User-Agent", chrome120UA)
-		resp, ferr := proxyClientNoVerify.Do(req)
-		if ferr != nil {
-			httpDetail(w, 500, ferr.Error())
-			return
+		resp, err := proxyClientNoVerify.Do(req)
+		if err != nil {
+			continue
 		}
 		lastStatus = resp.StatusCode
 		if resp.StatusCode != http.StatusOK {
 			_ = resp.Body.Close()
 			continue
 		}
-		if !wantDecode {
-			streamImageResponse(w, resp, "public, max-age=31536000")
-			_ = resp.Body.Close()
-			return
-		}
-		body, rerr2 := io.ReadAll(io.LimitReader(resp.Body, imgDecodeMaxBody))
+		streamImageResponse(w, resp, "public, max-age=31536000")
 		_ = resp.Body.Close()
-		if rerr2 != nil {
-			httpDetail(w, 500, rerr2.Error())
-			return
-		}
-		if out, ct, ok := decodeChapterImage(r.Context(), body, epsID, scrambleID, picName); ok {
-			imgDecoded.put(cacheKey, out, ct)
-			writeChapterImage(w, ct, out)
-			return
-		}
-		// 解码失败（格式不支持/图片损坏）：原样回发，避免整页空白。
-		writeChapterImage(w, http.DetectContentType(body), body)
 		return
 	}
 	if lastStatus == 0 {
-		httpDetail(w, 404, "Image not found")
-		return
+		lastStatus = http.StatusNotFound
 	}
 	httpDetail(w, lastStatus, "Image not found")
 }

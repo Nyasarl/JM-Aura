@@ -105,6 +105,7 @@ func NewRouter() *http.ServeMux {
 	route(mux, http.MethodGet, "/api/v2/{source}/novel/export/tasks/{task_id}/download", handleV2NovelExportDownload)
 
 	route(mux, http.MethodPost, "/api/v2/cache/cleanup", handleV2CacheCleanup)
+	route(mux, http.MethodGet, "/api/v2/cache/stats", handleV2CacheStats)
 
 	registerSPA(mux)
 	return mux
