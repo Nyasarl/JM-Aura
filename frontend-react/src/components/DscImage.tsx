@@ -12,9 +12,10 @@ import { md5 } from '../md5'
 // （/api/chapter_image?scramble=...），也就是「前端优先、失败才上服务端」。
 //
 // 为什么需要回退：iOS Safari 对 canvas 总内存有硬上限（约设备内存 1/4），超限后
-// getContext 返回 null 或画布被静默清空。这里用两个机制把失败概率压到最低：
-//   1) 只保留最近 MAX_LIVE_CANVASES 张已解码画布，远离视口的页面主动释放位图；
-//   2) 还原后读回一个像素校验，发现画布已被清空就判定失败。
+// getContext 返回 null 或画布被静默清空。这里用三个机制把失败概率压到最低：
+//   1) 视口带宽度按屏高自适应，带外的页面立刻交回位图（手机不会同时持有五六张长条漫画面）；
+//   2) 再加一层字节预算（张数 + 总字节数），超预算时只回收「离视口最远且已离开视口带」的画布；
+//   3) 还原后读回一个像素校验，发现画布已被清空就判定失败。
 // 一旦本设备连续失败，后续图片直接走服务端（熔断），避免每张图都白试一次。
 
 // 设备级熔断状态：模块作用域，同一页面会话内共享。
@@ -29,22 +30,72 @@ export function resetCanvasAvailability() {
   canvasDisabled = false
 }
 
-// 已解码画布列表（模块级），超出上限时释放，避免逼近 iOS canvas 总内存上限。
-// 每一项记录是否仍在视口内：优先释放已离开视口的画布，
-// 否则把用户正在看的图逐出后会立刻触发重新解码，白耗一次 CPU。
+// 已解码画布列表（模块级），超出预算时释放，避免逼近 iOS canvas 总内存上限。
+// 只限张数挡不住长条漫：单张 800×5000 就是 16MB，8 张就到 128MB，所以张数与总字节一起卡。
+//
+// 最关键的约束：**只回收已经离开视口带的画布**。因为「离开视口带就交回位图、回到视口带才重解码」
+// 与这里用的 `active()` 是同一个判定，回收与重解码天然互斥，不会出现
+// 「释放 A → A 仍在视口带内 → 立刻重解码 → 又超预算 → 再释放 A」这种自我激发的死循环。
+// （旧实现「优先逐出离开视口的，一个都没有就逐出第一个」正好会逐出仍带内的画布，
+//   于是读到后面几页就进入反复解码/建画布的抖动，在 iOS 上表现为画面错乱、越读越卡。）
 interface LiveCanvas {
   release: () => void
-  visible: () => boolean
+  /** 是否仍在视口带内（与释放/重解码同一个信号）。 */
+  active: () => boolean
+  /** 与视口的垂直距离（px），越大越先被回收。 */
+  distance: () => number
+  /** 位图字节数（w*h*4），用于总量预算。 */
+  bytes: number
 }
 const liveCanvases: LiveCanvas[] = []
-const MAX_LIVE_CANVASES = 8
+const MAX_LIVE_CANVASES = 4
+const MAX_LIVE_CANVAS_BYTES = 32 * 1024 * 1024
 
-function retainCanvas(release: () => void, visible: () => boolean) {
-  liveCanvases.push({ release, visible })
-  while (liveCanvases.length > MAX_LIVE_CANVASES) {
-    const offscreen = liveCanvases.findIndex((c) => !c.visible())
-    const victim = liveCanvases.splice(offscreen < 0 ? 0 : offscreen, 1)[0]
-    if (victim) victim.release()
+// 明确标记「这张 canvas 已被丢弃」。位图统一放在 effect cleanup 里清空，
+// 而 Dev 的 StrictMode 会把 effect 跑成 mount→cleanup→mount：
+// 这种情况下同一张 canvas 会被重新挂回来，若 cleanup 无条件置零就会看到空白页。
+const discardedCanvases = new WeakSet<HTMLCanvasElement>()
+
+/** 元素与视口的垂直距离：0 表示正与视口相交。 */
+function viewportDistance(el: Element | null): number {
+  if (!el || typeof el.getBoundingClientRect !== 'function') return Number.MAX_SAFE_INTEGER
+  const rect = el.getBoundingClientRect()
+  const vh = window.innerHeight || 0
+  if (rect.bottom < 0) return -rect.bottom
+  if (rect.top > vh) return rect.top - vh
+  return 0
+}
+
+/** 视口带宽度：按屏高自适应而不是写死像素。
+ * 手机上一屏 800 多 px，1.2 屏就够提前解码；写死 3000px 会让手机同时持有五六张
+ * 长条漫画面（最坏 ≈100MB），这正是 iOS canvas 内存被顶爆、画面错乱的来源。 */
+function bandMargin(): string {
+  const vh = typeof window === 'undefined' ? 800 : window.innerHeight || 800
+  return `${Math.round(Math.min(2400, Math.max(900, vh * 1.2)))}px 0px`
+}
+
+function retainCanvas(canvas: LiveCanvas) {
+  liveCanvases.push(canvas)
+  let bytes = liveCanvases.reduce((n, c) => n + c.bytes, 0)
+  while (liveCanvases.length > MAX_LIVE_CANVASES || bytes > MAX_LIVE_CANVAS_BYTES) {
+    let victimIndex = -1
+    let worst = -1
+    for (let i = 0; i < liveCanvases.length; i++) {
+      const c = liveCanvases[i]
+      // 刚挂上的这张、以及仍在视口带内的图都不回收。一个可回收的都找不到时
+      // 宁可暂时超出预算（张数已被视口带兜住），也不能把用户正在看的页面逐出去。
+      if (c === canvas || c.active()) continue
+      const d = c.distance()
+      if (d > worst) {
+        worst = d
+        victimIndex = i
+      }
+    }
+    if (victimIndex < 0) break
+    const victim = liveCanvases[victimIndex]
+    liveCanvases.splice(victimIndex, 1)
+    bytes -= victim.bytes
+    victim.release()
   }
 }
 
@@ -75,7 +126,7 @@ function observeVisibility(el: Element, cb: (visible: boolean) => void): () => v
           ioCallbacks.get(entry.target)?.(entry.isIntersecting)
         }
       },
-      { rootMargin: '3000px 0px' },
+      { rootMargin: bandMargin() },
     )
   }
   ioCallbacks.set(el, cb)
@@ -163,10 +214,15 @@ function DscImage({ src, serverSrc, comicId, scrambleId, index = 0, lazyAfter, f
   }, [])
 
   // 释放当前持有画布：回到占位态，等再次进入视口时重新还原。
+  // 统一走 release()，这样「离开视口」这条最常见的路径也会在 DOM 摘除后立刻清空位图
+  //（只靠 GC 回收不够及时，iOS 上尤其明显）。
   const releaseCurrent = useCallback(() => {
-    if (releaseRef.current) {
-      dropCanvas(releaseRef.current)
+    const release = releaseRef.current
+    if (release) {
+      dropCanvas(release)
       releaseRef.current = null
+      release()
+      return
     }
     setCanvasEl(null)
     setDisplaySrc('')
@@ -338,29 +394,47 @@ function DscImage({ src, serverSrc, comicId, scrambleId, index = 0, lazyAfter, f
     if (!container || !canvasEl) return
     container.innerHTML = ''
     canvasEl.style.width = '100%'
-    canvasEl.style.maxWidth = fullWidth ? 'none' : '900px'
     canvasEl.style.margin = '0 auto'
     canvasEl.style.display = 'block'
     canvasEl.style.userSelect = 'none'
     canvasEl.style.webkitUserSelect = 'none'
     container.appendChild(canvasEl)
-    // 登记到模块级存活表：超出上限时优先释放已离开视口的画布。
+    // 登记到模块级存活表：超出张数/字节预算时回收离视口最远的画布。
     const release = () => {
-      // 主动把位图置零，让 iOS 立刻回收 canvas 显存（只等 GC 不够及时，
-      // 而 iOS 对 canvas 总内存有硬上限，正是「图片未解码」的根因）。
-      canvasEl.width = 0
-      canvasEl.height = 0
+      // 这里只回退到占位态，位图清空交给下面的 effect cleanup（DOM 摘除之后）做。
+      // 顺序很关键：在「还挂在页面上」的 canvas 上直接把宽高设成 0，会让它当场塌成 0 高，
+      // 在两帧之间留下一次画面突变——iOS 上这一帧特别容易被看到。
+      discardedCanvases.add(canvasEl)
       setCanvasEl(null)
       setDisplaySrc('')
       setPhase('idle')
     }
     releaseRef.current = release
-    retainCanvas(release, () => visibleRef.current)
+    retainCanvas({
+      release,
+      bytes: canvasEl.width * canvasEl.height * 4,
+      active: () => visibleRef.current,
+      distance: () => viewportDistance(holderRef.current),
+    })
     return () => {
       dropCanvas(release)
       if (releaseRef.current === release) releaseRef.current = null
       if (canvasEl.parentElement === container) container.removeChild(canvasEl)
+      // 从 DOM 上摘掉之后再置零位图，让 iOS 立刻回收 canvas 显存
+      //（只等 GC 不够及时，而 iOS 对 canvas 总内存有硬上限，正是「图片未解码」的根因）。
+      // 只有确实被丢弃过（走过 release）的才置零，避免 StrictMode 重挂时把活的位图清掉。
+      if (discardedCanvases.has(canvasEl)) {
+        discardedCanvases.delete(canvasEl)
+        canvasEl.width = 0
+        canvasEl.height = 0
+      }
     }
+  }, [canvasEl])
+
+  // 宽度上限只改样式，不再重挂 canvas：重挂会把上一步刚清空的位图又贴回去（页面变空白）。
+  useEffect(() => {
+    if (!canvasEl) return
+    canvasEl.style.maxWidth = fullWidth ? 'none' : '900px'
   }, [canvasEl, fullWidth])
 
   const retry = () => {

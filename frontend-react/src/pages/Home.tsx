@@ -9,8 +9,16 @@ import MenuBookIcon from '@mui/icons-material/MenuBook'
 import PlayArrowIcon from '@mui/icons-material/PlayArrow'
 import Typography from '@mui/material/Typography'
 import { api, imgUrl } from '../api'
-import { sourcePath, type SourceKind } from '../source'
-import { CenterLoading, ComicCoverRow, ErrorState, NovelCard, SectionTitle, useAsync } from '../components'
+import { appLink, sourceFromPath, sourcePath, type SourceKind } from '../source'
+import {
+  CenterLoading,
+  ComicCoverRow,
+  ErrorState,
+  MoreTile,
+  NovelCard,
+  SectionTitle,
+  useAsync,
+} from '../components'
 import type { ComicSummary, NovelSummary } from '../types'
 import { useAuth } from '../auth'
 
@@ -228,7 +236,13 @@ function ContinueReading() {
   )
 }
 
-function NovelCoverRow({ items }: { items: NovelSummary[] }) {
+function NovelCoverRow({
+  items,
+  more,
+}: {
+  items: NovelSummary[]
+  more?: { to: string; label?: string }
+}) {
   if (items.length === 0) return null
   return (
     <Box
@@ -237,7 +251,8 @@ function NovelCoverRow({ items }: { items: NovelSummary[] }) {
         gap: 1.5,
         overflowX: 'auto',
         overscrollBehaviorX: 'contain',
-        scrollSnapType: 'x mandatory',
+        // 与 ComicCoverRow 同理：mandatory 吸附 + 出血内边距在 iOS 上会「滑不动」。
+        scrollSnapType: 'x proximity',
         WebkitOverflowScrolling: 'touch',
         scrollbarWidth: 'none',
         msOverflowStyle: 'none',
@@ -255,6 +270,7 @@ function NovelCoverRow({ items }: { items: NovelSummary[] }) {
           <NovelCard novel={n} />
         </Box>
       ))}
+      {more ? <MoreTile to={more.to} label={more.label} /> : null}
     </Box>
   )
 }
@@ -287,13 +303,29 @@ export default function Home() {
                   <SectionTitle>
                     <MenuBookIcon sx={{ color: 'primary.main' }} /> {section.title || '编辑推荐'}
                   </SectionTitle>
-                  <NovelCoverRow items={novels} />
+                  <NovelCoverRow
+                    items={novels}
+                    more={
+                      // 目标页必须存在于「当前源」：哔咔源没有 /novels。
+                      sourceFromPath() === 'bika'
+                        ? undefined
+                        : { to: appLink('/novels'), label: '全部小说' }
+                    }
+                  />
                 </Box>
               ) : null}
               {comics.length > 0 ? (
                 <Box sx={{ mb: 3.5 }}>
                   <SectionTitle>{section.title || '编辑推荐'}</SectionTitle>
-                  <ComicCoverRow items={comics} />
+                  <ComicCoverRow
+                    items={comics}
+                    // 行本身没有分页接口，只给出口：能翻页的完整列表页；
+                    // 哔咔源没有 /latest，退回分类页，保证链接不会点空。
+                    more={{
+                      to: appLink(sourceFromPath() === 'bika' ? '/categories' : '/latest'),
+                      label: '更多',
+                    }}
+                  />
                 </Box>
               ) : null}
             </Fragment>

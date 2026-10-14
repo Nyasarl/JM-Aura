@@ -18,6 +18,7 @@ import Radio from '@mui/material/Radio'
 import RadioGroup from '@mui/material/RadioGroup'
 import TextField from '@mui/material/TextField'
 import Typography from '@mui/material/Typography'
+import ChevronRightIcon from '@mui/icons-material/ChevronRight'
 import { api, imgUrl } from './api'
 import type { ComicSummary, NovelSummary } from './types'
 
@@ -257,11 +258,51 @@ export function ComicGrid({ items }: { items: ComicSummary[] }) {
   )
 }
 
+/** 横向推荐行尾的「查看更多」卡片。
+ * 首页每一行只渲染上游 promote 返回的那几条推荐，行本身没有分页接口，
+ * 所以必须给用户一个通往完整列表的出口，否则右侧滑到头也就只有那几张。
+ * 用 flex 默认的 align-items: stretch 让卡片和封面等高，行高由卡片自己决定。 */
+export function MoreTile({ to, label }: { to: string; label?: string }) {
+  return (
+    <Box
+      component={RouterLink}
+      to={to}
+      sx={{
+        flex: '0 0 auto',
+        scrollSnapAlign: 'start',
+        width: { xs: 108, sm: 128 },
+        minHeight: 120,
+        display: 'flex',
+        flexDirection: 'column',
+        alignItems: 'center',
+        justifyContent: 'center',
+        gap: 0.5,
+        border: '1px dashed',
+        borderColor: 'divider',
+        borderRadius: 2,
+        bgcolor: 'action.hover',
+        color: 'text.secondary',
+        textDecoration: 'none',
+        '&:hover': { color: 'primary.main', borderColor: 'primary.main' },
+      }}
+    >
+      <ChevronRightIcon />
+      <Typography variant="caption">{label ?? '更多'}</Typography>
+    </Box>
+  )
+}
+
 /**
  * 横向封面行：scroll-snap + 隐藏滚动条 + iOS 惯性滚动。
  * 首页各分区（编辑推荐 / 排行榜）共用，避免每个页面各写一份。
  */
-export function ComicCoverRow({ items }: { items: ComicSummary[] }) {
+export function ComicCoverRow({
+  items,
+  more,
+}: {
+  items: ComicSummary[]
+  more?: { to: string; label?: string }
+}) {
   if (items.length === 0) return null
   return (
     <Box
@@ -270,7 +311,10 @@ export function ComicCoverRow({ items }: { items: ComicSummary[] }) {
         gap: 1.5,
         overflowX: 'auto',
         overscrollBehaviorX: 'contain',
-        scrollSnapType: 'x mandatory',
+        // 用 proximity 而不是 mandatory：这一行有 px:2/mx:-2 的出血内边距，
+        // iOS 的强制吸附会拿内边距算吸附点、跟手指拖动互相拉锯，
+        // 表现就是「标题写着右滑看更多，但怎么滑都停在原地」（桌面端反而正常）。
+        scrollSnapType: 'x proximity',
         WebkitOverflowScrolling: 'touch',
         scrollbarWidth: 'none',
         msOverflowStyle: 'none',
@@ -288,6 +332,7 @@ export function ComicCoverRow({ items }: { items: ComicSummary[] }) {
           <ComicCard comic={c} />
         </Box>
       ))}
+      {more ? <MoreTile to={more.to} label={more.label} /> : null}
     </Box>
   )
 }

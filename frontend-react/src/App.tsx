@@ -125,6 +125,15 @@ const BIKA_PAGES: Array<[string, ReactNode]> = [
 // expanded(≥lg) Navigation Drawer；导航区容器 = surface container，
 // 激活态 = secondaryContainer 胶囊 indicator。
 const DRAWER_WIDTH = 260
+// iOS 独立窗口（index.html 里 apple-mobile-web-app-status-bar-style=black-translucent +
+// viewport-fit=cover）会把系统状态栏浮在页面最上方。顶栏若不让出顶部安全区，状态栏就会压住它，
+// 表现为「顶部账号名/头像那一行看不全、也点不到」。普通浏览器与 Android 上 env() 恒为 0，
+// 布局与改动前完全一致，因此这是纯增益的兼容性修复。
+const TOP_INSET = 'env(safe-area-inset-top)'
+// Material 默认 Toolbar 高 56px（xs）/ 64px（sm+），theme.ts 未覆盖它；
+// 顶栏实际总高 = Toolbar 高 + 顶部安全区。占位块与侧栏偏移必须用同一个值，否则内容会被顶栏压住。
+const APPBAR_H_SM = `calc(64px + ${TOP_INSET})`
+const APPBAR_HEIGHT = { xs: `calc(56px + ${TOP_INSET})`, sm: APPBAR_H_SM }
 const RAIL_WIDTH = 88
 
 interface NavItem {
@@ -513,7 +522,7 @@ export default function App() {
     <Box sx={{ display: 'flex', minHeight: '100dvh' }}>
       <Announcement />
       {!isReader && (
-        <AppBar position="fixed" sx={{ zIndex: (t) => t.zIndex.drawer + 1 }}>
+        <AppBar position="fixed" sx={{ zIndex: (t) => t.zIndex.drawer + 1, pt: TOP_INSET }}>
           <Toolbar sx={{ gap: 1 }}>
             <Logo />
             <Box sx={{ flexGrow: 1 }} />
@@ -558,7 +567,7 @@ export default function App() {
           sx={{
             width: DRAWER_WIDTH,
             flexShrink: 0,
-            '& .MuiDrawer-paper': { ...drawerPaper, position: 'relative', mt: '64px' },
+            '& .MuiDrawer-paper': { ...drawerPaper, position: 'relative', mt: APPBAR_H_SM },
           }}
         >
           <DrawerContent />
@@ -574,7 +583,7 @@ export default function App() {
             '& .MuiDrawer-paper': {
               width: RAIL_WIDTH,
               position: 'relative',
-              mt: '64px',
+              mt: APPBAR_H_SM,
               bgcolor: 'aura.surfaceContainer',
               boxSizing: 'border-box',
             },
@@ -604,7 +613,7 @@ export default function App() {
           ...(isReader && { p: 0, maxWidth: 'none' }),
         }}
       >
-        {!isReader && <Toolbar />}
+        {!isReader && <Box sx={{ height: APPBAR_HEIGHT }} />}
         <Suspense fallback={<CenterLoading />}>
           <Routes>
             {/* JM：无前缀（历史兼容形态）与 /jm 别名并存 */}
