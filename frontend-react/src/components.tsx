@@ -1,5 +1,5 @@
-import { useCallback, useEffect, useRef, useState } from 'react'
-import type { ReactNode } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import type { ReactNode, RefObject } from 'react'
 import { Link as RouterLink } from 'react-router-dom'
 import { appLink } from './source'
 import Alert from '@mui/material/Alert'
@@ -18,7 +18,6 @@ import Radio from '@mui/material/Radio'
 import RadioGroup from '@mui/material/RadioGroup'
 import TextField from '@mui/material/TextField'
 import Typography from '@mui/material/Typography'
-import ChevronRightIcon from '@mui/icons-material/ChevronRight'
 import { api, imgUrl } from './api'
 import type { ComicSummary, NovelSummary } from './types'
 
@@ -258,38 +257,120 @@ export function ComicGrid({ items }: { items: ComicSummary[] }) {
   )
 }
 
-/** 横向推荐行尾的「查看更多」卡片。
- * 首页每一行只渲染上游 promote 返回的那几条推荐，行本身没有分页接口，
- * 所以必须给用户一个通往完整列表的出口，否则右侧滑到头也就只有那几张。
- * 用 flex 默认的 align-items: stretch 让卡片和封面等高，行高由卡片自己决定。 */
-export function MoreTile({ to, label }: { to: string; label?: string }) {
-  return (
-    <Box
-      component={RouterLink}
-      to={to}
-      sx={{
-        flex: '0 0 auto',
-        scrollSnapAlign: 'start',
-        width: { xs: 108, sm: 128 },
-        minHeight: 120,
-        display: 'flex',
-        flexDirection: 'column',
-        alignItems: 'center',
-        justifyContent: 'center',
-        gap: 0.5,
-        border: '1px dashed',
-        borderColor: 'divider',
-        borderRadius: 2,
-        bgcolor: 'action.hover',
-        color: 'text.secondary',
-        textDecoration: 'none',
-        '&:hover': { color: 'primary.main', borderColor: 'primary.main' },
-      }}
-    >
-      <ChevronRightIcon />
-      <Typography variant="caption">{label ?? '更多'}</Typography>
-    </Box>
-  )
+// 行内条目的稳定 key。必须定义在模块级：如果每次渲染现造一个函数，
+// useRowInfinite 内部所有依赖它的 useCallback/effect 都会重建，
+// 行尾哨兵的 IntersectionObserver 会被反复重挂。
+const comicRowKey = (c: ComicSummary) => `${c.source}-${c.comic_id}`
+
+/**
+ * 横向行「滑到右端继续加载」的通用实现。
+ *
+ * 触发方式是在行尾放一个哨兵元素，用 IntersectionObserver 以「行自身」为 root、
+ * 右侧留 800px 提前量：用户还没滑到头就已经把下一页取回来了，所以一直往右滑
+ * 都有内容，不会出现「滑到头停住、还得点一下」。
+ *
+ * 没有 loadMore 的行（上游确实没有更多内容）什么都不做，就停在已有条目上——
+ * 这种情况下给「更多」跳走反而更糟，用户要的是在行内继续看。
+ */
+export function useRowInfinite<T>(
+  items: T[],
+  keyOf: (item: T) => string,
+  loadMore?: (page: number) => Promise<T[]>,
+  cap = 120,
+): { shown: T[]; loading: boolean; sentinelRef: RefObject<HTMLDivElement | null> } {
+  const [extra, setExtra] = useState<T[]>([])
+  const [loading, setLoading] = useState(false)
+  const [done, setDone] = useState(false)
+  const sentinelRef = useRef<HTMLDivElement | null>(null)
+  const pageRef = useRef(1)
+  const busyRef = useRef(false)
+  const idsRef = useRef<Set<string>>(new Set())
+
+  // 行内容整体换掉（切源、重新拉取）时清空追加项，避免旧内容的条目残留在新行里。
+  const signature = items.map(keyOf).join('|')
+  useEffect(() => {
+    setExtra([])
+    setDone(false)
+    setLoading(false)
+    pageRef.current = 1
+    busyRef.current = false
+  }, [signature])
+
+  const shown = useMemo(() => {
+    const seen = new Set<string>()
+    const out: T[] = []
+    for (const it of items.concat(extra)) {
+      const k = keyOf(it)
+      if (!k || seen.has(k)) continue
+      seen.add(k)
+      out.push(it)
+    }
+    return out
+  }, [items, extra, keyOf])
+
+  useEffect(() => {
+    idsRef.current = new Set(shown.map(keyOf))
+  }, [shown, keyOf])
+
+  const load = useCallback(async () => {
+    if (!loadMore || busyRef.current || done) return
+    // 到上限就停：行会随追加无限变长，得留个天花板。
+    if (idsRef.current.size >= cap) {
+      setDone(true)
+      return
+    }
+    busyRef.current = true
+    setLoading(true)
+    try {
+      const got = await loadMore(pageRef.current)
+      pageRef.current += 1
+      // 去重：分类行的「最新」序列和上游推荐块会重叠。
+      const fresh = got.filter((it) => {
+        const k = keyOf(it)
+        return Boolean(k) && !idsRef.current.has(k)
+      })
+      if (fresh.length === 0) {
+        setDone(true)
+        return
+      }
+      for (const it of fresh) idsRef.current.add(keyOf(it))
+      setExtra((prev) => prev.concat(fresh))
+    } catch {
+      // 出错就停在这一页，不自动重试——否则滑到头会反复打接口。
+      setDone(true)
+    } finally {
+      busyRef.current = false
+      setLoading(false)
+    }
+  }, [loadMore, done, cap, keyOf])
+
+  useEffect(() => {
+    const el = sentinelRef.current
+    if (!el || !loadMore) return
+    if (typeof IntersectionObserver === 'undefined') {
+      void load()
+      return
+    }
+    const io = new IntersectionObserver(
+      (entries) => {
+        if (entries.some((e) => e.isIntersecting)) void load()
+      },
+      { root: el.parentElement, rootMargin: '0px 800px 0px 0px' },
+    )
+    io.observe(el)
+    return () => io.disconnect()
+  }, [load, loadMore])
+
+  // 追加之后行变长了，哨兵若仍在提前量内就接着取（一屏宽可能需要连续取两页）。
+  useEffect(() => {
+    if (!loadMore || done || loading) return
+    const el = sentinelRef.current
+    if (!el) return
+    const vw = window.innerWidth || 0
+    if (el.getBoundingClientRect().left < vw + 800) void load()
+  }, [extra, done, loading, load, loadMore])
+
+  return { shown, loading, sentinelRef }
 }
 
 /**
@@ -298,11 +379,20 @@ export function MoreTile({ to, label }: { to: string; label?: string }) {
  */
 export function ComicCoverRow({
   items,
-  more,
+  loadMore,
+  cap,
 }: {
   items: ComicSummary[]
-  more?: { to: string; label?: string }
+  /** 滑到右端时继续取下一页；不传表示这一行上游没有更多，就停在已有条目上。 */
+  loadMore?: (page: number) => Promise<ComicSummary[]>
+  cap?: number
 }) {
+  const { shown, loading, sentinelRef } = useRowInfinite(
+    items,
+    comicRowKey,
+    loadMore,
+    cap,
+  )
   if (items.length === 0) return null
   return (
     <Box
@@ -324,7 +414,7 @@ export function ComicCoverRow({
         pb: 1,
       }}
     >
-      {items.map((c) => (
+      {shown.map((c) => (
         <Box
           key={`${c.source}-${c.comic_id}`}
           sx={{ flex: '0 0 auto', width: { xs: 108, sm: 128 }, scrollSnapAlign: 'start' }}
@@ -332,7 +422,26 @@ export function ComicCoverRow({
           <ComicCard comic={c} />
         </Box>
       ))}
-      {more ? <MoreTile to={more.to} label={more.label} /> : null}
+      {loadMore ? (
+        <>
+          {loading ? (
+            <Box
+              sx={{
+                flex: '0 0 auto',
+                width: { xs: 108, sm: 128 },
+                minHeight: 120,
+                display: 'flex',
+                alignItems: 'center',
+                justifyContent: 'center',
+              }}
+            >
+              <CircularProgress size={22} thickness={4} />
+            </Box>
+          ) : null}
+          {/* 哨兵：只占 1px，进入右端提前量就触发取下一页 */}
+          <Box ref={sentinelRef} sx={{ flex: '0 0 auto', width: '1px', alignSelf: 'stretch' }} />
+        </>
+      ) : null}
     </Box>
   )
 }

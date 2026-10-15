@@ -28,6 +28,8 @@ func NewRouter() *http.ServeMux {
 
 	route(mux, http.MethodGet, "/api/aura/library/history", handleAuraHistoryGet)
 	route(mux, http.MethodPost, "/api/aura/library/history", handleAuraHistoryPost)
+	route(mux, http.MethodGet, "/api/aura/reader/settings", handleAuraReaderSettingsGet)
+	route(mux, http.MethodPut, "/api/aura/reader/settings", handleAuraReaderSettingsPut)
 
 	route(mux, http.MethodGet, "/api/recommend", handleRecommendList)
 	route(mux, http.MethodPost, "/api/recommend", handleRecommendCreate)

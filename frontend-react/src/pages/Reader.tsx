@@ -24,7 +24,12 @@ import { FavoriteFolderDialog, useAsync } from '../components'
 import type { FavoriteFolder } from '../components'
 import { useAuth } from '../auth'
 import { useToast } from '../toast'
-import DscImage, { resetCanvasAvailability } from '../components/DscImage'
+import DscImage, {
+  DEFAULT_KEEP_PAGES,
+  notifyViewportChanged,
+  resetCanvasAvailability,
+  setKeepPages,
+} from '../components/DscImage'
 import { appLink } from '../source'
 import { chapterImageServerUrl, chapterImageUrl } from '../types'
 import type { ChapterDetail, ComicDetail } from '../types'
@@ -34,9 +39,11 @@ interface ReaderSettings {
   gap: number
   initial: number
   batch: number
+  /** 上方向保留页数（1..4）：越大越不容易「上一页黑掉」，代价是同时持有更多画布。 */
+  keepPages: number
 }
 
-const DEFAULT_SETTINGS: ReaderSettings = { width: 100, gap: 0, initial: 4, batch: 3 }
+const DEFAULT_SETTINGS: ReaderSettings = { width: 100, gap: 0, initial: 4, batch: 3, keepPages: DEFAULT_KEEP_PAGES }
 const SETTINGS_KEY = 'jm.reader.settings.v1'
 // 旧版默认间距为 8px，且会被自动写入 localStorage；改默认 0px 后一并迁移存量数据
 const LEGACY_GAP_DEFAULT = 8
@@ -59,6 +66,7 @@ function loadSettings(): ReaderSettings {
       gap,
       initial: clamp(p.initial, 1, 12, DEFAULT_SETTINGS.initial),
       batch: clamp(p.batch, 1, 6, DEFAULT_SETTINGS.batch),
+      keepPages: clamp(p.keepPages, 1, 4, DEFAULT_SETTINGS.keepPages),
     }
   } catch {
     return DEFAULT_SETTINGS
@@ -147,6 +155,8 @@ export default function Reader() {
   const prependRef = useRef<{ h: number; st: number } | null>(null)
   const saveTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
   const pageIdx = useRef(0)
+  // 用户是否手动改过设置：决定远端设置套不套用、改动要不要回写服务端。
+  const touchedRef = useRef(false)
 
   const resumePage = useMemo(() => {
     const n = Number(params.get('page') ?? 0)
@@ -203,6 +213,12 @@ export default function Reader() {
       ),
     [names, start, limit, chapterId, imgDomain, scrambleId],
   )
+
+  // 所有设置改动都走这里：标记「用户动过」，供远端套用/回写判断。
+  const applySetting = (patch: Partial<ReaderSettings>) => {
+    touchedRef.current = true
+    setSettings((s) => ({ ...s, ...patch }))
+  }
 
   const showControls = () => {
     setControls(true)
@@ -295,6 +311,64 @@ export default function Reader() {
       /* 隐私模式写入失败可忽略 */
     }
   }, [settings])
+
+  // 保留页数是 DscImage 的模块级共享状态，设置一变必须立刻同步，
+  // 否则改完设置要等下次挂载才生效。
+  useEffect(() => {
+    setKeepPages(settings.keepPages)
+  }, [settings.keepPages])
+
+  // 阅读器设置随账号存到服务端：localStorage 只活在单台设备上，
+  // 换设备/清缓存就丢，而「保留几页」直接关系内存与卡顿，值得跟账号走。
+  // 访客没有账号，继续只用 localStorage。
+  useEffect(() => {
+    if (!user) return
+    let cancelled = false
+    void (async () => {
+      try {
+        const remote = await api.get<Record<string, unknown> | null>('/api/aura/reader/settings')
+        if (cancelled || !remote) return
+        // 只在用户还没动过设置时套用远端值，避免刚打开就覆盖用户刚拖的滑块。
+        if (touchedRef.current) return
+        setSettings((s) => {
+          const num = (v: unknown, min: number, max: number, fb: number) => {
+            const n = Number(v)
+            return Number.isFinite(n) ? Math.min(max, Math.max(min, n)) : fb
+          }
+          return {
+            width: num(remote.width, 20, 100, s.width),
+            gap: num(remote.gap, 0, 50, s.gap),
+            initial: num(remote.initial, 1, 12, s.initial),
+            batch: num(remote.batch, 1, 6, s.batch),
+            keepPages: num(remote.keep_pages, 1, 4, s.keepPages),
+          }
+        })
+      } catch {
+        /* 取不到就用本地值，不打扰阅读 */
+      }
+    })()
+    return () => {
+      cancelled = true
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [user?.username])
+
+  // 改动防抖回写服务端（拖滑块会连续触发，别每帧打一次接口）。
+  useEffect(() => {
+    if (!user || !touchedRef.current) return
+    const t = setTimeout(() => {
+      void api
+        .put('/api/aura/reader/settings', {
+          width: settings.width,
+          gap: settings.gap,
+          initial: settings.initial,
+          batch: settings.batch,
+          keep_pages: settings.keepPages,
+        })
+        .catch(() => {})
+    }, 800)
+    return () => clearTimeout(t)
+  }, [settings, user])
 
   // 卸载时兜底上报最后进度
   useEffect(() => {
@@ -391,6 +465,9 @@ export default function Reader() {
         scrollRaf.current = 0
         const el = scrollRef.current
         if (el) maybeLoadMore(el)
+        // 保留范围随滚动连续变化，这里统一让所有已挂载图片重算一次
+        //（载入/释放都走同一个判定，见 DscImage 的 keepElement）。
+        notifyViewportChanged()
       })
     }
     saveProgress(root)
@@ -829,7 +906,7 @@ export default function Reader() {
                 max={100}
                 step={5}
                 value={settings.width}
-                onChange={(v) => setSettings((s) => ({ ...s, width: v }))}
+                onChange={(v) => applySetting({ width: v })}
               />
               <SettingSlider
                 label="页面间距"
@@ -838,7 +915,7 @@ export default function Reader() {
                 max={50}
                 step={5}
                 value={settings.gap}
-                onChange={(v) => setSettings((s) => ({ ...s, gap: v }))}
+                onChange={(v) => applySetting({ gap: v })}
               />
               <SettingSlider
                 label="初始加载"
@@ -847,7 +924,7 @@ export default function Reader() {
                 max={12}
                 step={1}
                 value={settings.initial}
-                onChange={(v) => setSettings((s) => ({ ...s, initial: v }))}
+                onChange={(v) => applySetting({ initial: v })}
               />
               <SettingSlider
                 label="追加批量"
@@ -856,8 +933,20 @@ export default function Reader() {
                 max={6}
                 step={1}
                 value={settings.batch}
-                onChange={(v) => setSettings((s) => ({ ...s, batch: v }))}
+                onChange={(v) => applySetting({ batch: v })}
               />
+              <SettingSlider
+                label="保留上几页"
+                unit="页"
+                min={1}
+                max={4}
+                step={1}
+                value={settings.keepPages}
+                onChange={(v) => applySetting({ keepPages: v })}
+              />
+              <Typography variant="caption" color="text.secondary" sx={{ mt: -2 }}>
+                往上翻回去时不重新解码的页数：调大更不容易看到黑页，代价是同时占用更多内存。
+              </Typography>
             </Box>
           )}
         </Box>

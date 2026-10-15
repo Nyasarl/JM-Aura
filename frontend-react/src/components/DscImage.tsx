@@ -13,10 +13,14 @@ import { md5 } from '../md5'
 //
 // 为什么需要回退：iOS Safari 对 canvas 总内存有硬上限（约设备内存 1/4），超限后
 // getContext 返回 null 或画布被静默清空。这里用三个机制把失败概率压到最低：
-//   1) 视口带宽度按屏高自适应，带外的页面立刻交回位图（手机不会同时持有五六张长条漫画面）；
-//   2) 再加一层字节预算（张数 + 总字节数），超预算时只回收「离视口最远且已离开视口带」的画布；
+//   1) 「保留范围」按屏高与页高自适应：视口带外 + 上方向保留 keepPages 页，
+//      范围外的页面才交回位图（默认 2 页，可由阅读器设置改 1..4）；
+//   2) 再加一层张数/字节预算，超预算时只回收「离视口最远且不在保留范围内」的画布；
 //   3) 还原后读回一个像素校验，发现画布已被清空就判定失败。
 // 一旦本设备连续失败，后续图片直接走服务端（熔断），避免每张图都白试一次。
+
+// 默认保留「上方」页数；阅读器会把用户设置写进来（见 setKeepPages）。
+export const DEFAULT_KEEP_PAGES = 2
 
 // 设备级熔断状态：模块作用域，同一页面会话内共享。
 let canvasFailCount = 0
@@ -31,16 +35,17 @@ export function resetCanvasAvailability() {
 }
 
 // 已解码画布列表（模块级），超出预算时释放，避免逼近 iOS canvas 总内存上限。
-// 只限张数挡不住长条漫：单张 800×5000 就是 16MB，8 张就到 128MB，所以张数与总字节一起卡。
+// 只限张数挡不住长条漫：单张 800×5000 就是 16MB，多张就是上百 MB，所以张数与总字节一起卡。
 //
-// 最关键的约束：**只回收已经离开视口带的画布**。因为「离开视口带就交回位图、回到视口带才重解码」
-// 与这里用的 `active()` 是同一个判定，回收与重解码天然互斥，不会出现
-// 「释放 A → A 仍在视口带内 → 立刻重解码 → 又超预算 → 再释放 A」这种自我激发的死循环。
-// （旧实现「优先逐出离开视口的，一个都没有就逐出第一个」正好会逐出仍带内的画布，
-//   于是读到后面几页就进入反复解码/建画布的抖动，在 iOS 上表现为画面错乱、越读越卡。）
+// 最关键的约束：**只回收不在保留范围内（keepElement=false）的画布**。
+// 因为「不在保留范围才交回位图、回到保留范围才重解码」与这里用的 `active()` 是同一个判定，
+// 回收与重解码天然互斥，不会出现「释放 A → A 仍在保留范围内 → 立刻重解码 → 又超预算
+// → 再释放 A」这种自我激发的死循环。（旧实现「优先逐出离开视口的，一个都没有就逐出第一个」
+// 正好会逐出仍在范围内的画布，于是读到后面几页就进入反复解码/建画布的抖动，
+// 在 iOS 上表现为画面错乱、越读越卡。）
 interface LiveCanvas {
   release: () => void
-  /** 是否仍在视口带内（与释放/重解码同一个信号）。 */
+  /** 是否仍在保留范围内（与释放/重解码同一个信号）。 */
   active: () => boolean
   /** 与视口的垂直距离（px），越大越先被回收。 */
   distance: () => number
@@ -48,15 +53,22 @@ interface LiveCanvas {
   bytes: number
 }
 const liveCanvases: LiveCanvas[] = []
-const MAX_LIVE_CANVASES = 4
-const MAX_LIVE_CANVAS_BYTES = 32 * 1024 * 1024
+// 张数/字节预算是「兜底阀门」，不是保留上限：真正的保留范围由 keepElement 决定，
+// 且保留中的画布永远不回收（否则会立刻重解码 → 抖动）。所以这里按 keepPages 放宽，
+// 只在异常路径（例如解码完成时页面已经被滚远）才回收离视口最远的画布。
+function maxLiveCanvases(): number {
+  return keepPagesSetting + 3
+}
+function maxLiveCanvasBytes(): number {
+  return 16 * 1024 * 1024 * maxLiveCanvases()
+}
 
 // 明确标记「这张 canvas 已被丢弃」。位图统一放在 effect cleanup 里清空，
 // 而 Dev 的 StrictMode 会把 effect 跑成 mount→cleanup→mount：
 // 这种情况下同一张 canvas 会被重新挂回来，若 cleanup 无条件置零就会看到空白页。
 const discardedCanvases = new WeakSet<HTMLCanvasElement>()
 
-/** 元素与视口的垂直距离：0 表示正与视口相交。 */
+/** 元素与视口的垂直距离（px）：0 表示与视口相交；仅用于预算回收时的优先级排序。 */
 function viewportDistance(el: Element | null): number {
   if (!el || typeof el.getBoundingClientRect !== 'function') return Number.MAX_SAFE_INTEGER
   const rect = el.getBoundingClientRect()
@@ -66,24 +78,81 @@ function viewportDistance(el: Element | null): number {
   return 0
 }
 
-/** 视口带宽度：按屏高自适应而不是写死像素。
- * 手机上一屏 800 多 px，1.2 屏就够提前解码；写死 3000px 会让手机同时持有五六张
- * 长条漫画面（最坏 ≈100MB），这正是 iOS canvas 内存被顶爆、画面错乱的来源。 */
-function bandMargin(): string {
+/** 视线带宽度（px）：带内即预载。按屏高自适应，手机上约 1.2 屏。 */
+function bandPx(): number {
   const vh = typeof window === 'undefined' ? 800 : window.innerHeight || 800
-  return `${Math.round(Math.min(2400, Math.max(900, vh * 1.2)))}px 0px`
+  return Math.round(Math.min(2400, Math.max(900, vh * 1.2)))
+}
+
+// 上方向保留页数（1..4），由阅读器按用户设置写入。
+let keepPagesSetting = DEFAULT_KEEP_PAGES
+
+export function setKeepPages(n: number) {
+  const v = Math.round(Number(n))
+  keepPagesSetting = Number.isFinite(v) && v > 0 ? Math.min(4, v) : DEFAULT_KEEP_PAGES
+}
+
+/**
+ * 该元素此刻是否应当持有画布。**载入与释放共用这一个判定**，所以二者天然互斥：
+ * 「保留 && 未载入 → 载入」与「不保留 && 已载入 → 释放」不可能同时成立，
+ * 也就不会出现自我激发的「释放 → 立刻重解码 → 再释放」抖动。
+ *
+ * 保留范围 = 视线带（下方 1.2 屏预载 + 上方 1.2 屏余量）∪ 视口上方「最近 keepPages 页」。
+ * 后者用元素自身高度折算页数：长条漫一页好几屏，若只按固定像素判断，
+ * 往下翻一屏就会把上一页丢掉——阅读器页面容器是黑底，看上去就是「上一页直接黑掉」。
+ */
+function keepElement(el: Element | null): boolean {
+  if (!el || typeof el.getBoundingClientRect !== 'function') return true
+  const rect = el.getBoundingClientRect()
+  const vh = window.innerHeight || 0
+  const band = bandPx()
+  if (rect.bottom > -band && rect.top < vh + band) return true
+  if (rect.bottom <= 0) {
+    const h = rect.height || (el as HTMLElement).offsetHeight || 0
+    return h > 0 && -rect.bottom <= h * keepPagesSetting
+  }
+  return false
+}
+
+// 共享节拍：滚动/尺寸变化后一帧内把所有已挂载图片一起重算一次。
+// 取代逐张 IntersectionObserver——保留判定要随滚动连续变化，
+// 而观察器只在跨越阈值时回调，跨过之后就不再通知，无法表达「已滚出多少页」。
+const tickers = new Set<() => void>()
+let tickQueued = false
+
+export function notifyViewportChanged() {
+  if (tickQueued) return
+  tickQueued = true
+  const run = () => {
+    tickQueued = false
+    for (const fn of Array.from(tickers)) fn()
+  }
+  if (typeof requestAnimationFrame === 'function') requestAnimationFrame(run)
+  else setTimeout(run, 16)
+}
+
+function subscribeTick(fn: () => void): () => void {
+  tickers.add(fn)
+  return () => {
+    tickers.delete(fn)
+  }
+}
+
+// 视口高度变化（横竖屏切换、iOS 地址栏收起）也要重算。
+if (typeof window !== 'undefined') {
+  window.addEventListener('resize', notifyViewportChanged)
 }
 
 function retainCanvas(canvas: LiveCanvas) {
   liveCanvases.push(canvas)
   let bytes = liveCanvases.reduce((n, c) => n + c.bytes, 0)
-  while (liveCanvases.length > MAX_LIVE_CANVASES || bytes > MAX_LIVE_CANVAS_BYTES) {
+  while (liveCanvases.length > maxLiveCanvases() || bytes > maxLiveCanvasBytes()) {
     let victimIndex = -1
     let worst = -1
     for (let i = 0; i < liveCanvases.length; i++) {
       const c = liveCanvases[i]
-      // 刚挂上的这张、以及仍在视口带内的图都不回收。一个可回收的都找不到时
-      // 宁可暂时超出预算（张数已被视口带兜住），也不能把用户正在看的页面逐出去。
+      // 刚挂上的这张、以及仍在保留范围内的图都不回收。一个可回收的都找不到时
+      // 宁可暂时超出预算（保留范围本身已经把数量兜住），也不能把用户正在看/刚看过的页面逐出去。
       if (c === canvas || c.active()) continue
       const d = c.distance()
       if (d > worst) {
@@ -107,34 +176,6 @@ function dropCanvas(release: () => void) {
 function noteCanvasFailure() {
   canvasFailCount += 1
   if (canvasFailCount >= CANVAS_FAIL_LIMIT) canvasDisabled = true
-}
-
-// 全部图片共用一个 IntersectionObserver：长章节会挂载很多张图，
-// 每张各建一个观察器（并在卸载时销毁）没必要，共用一个只需一次注册开销。
-const ioCallbacks = new WeakMap<Element, (visible: boolean) => void>()
-let sharedObserver: IntersectionObserver | null = null
-
-function observeVisibility(el: Element, cb: (visible: boolean) => void): () => void {
-  if (typeof IntersectionObserver === 'undefined') {
-    cb(true)
-    return () => {}
-  }
-  if (!sharedObserver) {
-    sharedObserver = new IntersectionObserver(
-      (entries) => {
-        for (const entry of entries) {
-          ioCallbacks.get(entry.target)?.(entry.isIntersecting)
-        }
-      },
-      { rootMargin: bandMargin() },
-    )
-  }
-  ioCallbacks.set(el, cb)
-  sharedObserver.observe(el)
-  return () => {
-    sharedObserver?.unobserve(el)
-    ioCallbacks.delete(el)
-  }
 }
 
 function isGif(url: string): boolean {
@@ -180,7 +221,6 @@ function DscImage({ src, serverSrc, comicId, scrambleId, index = 0, lazyAfter, f
   const [displaySrc, setDisplaySrc] = useState('')
   const [canvasEl, setCanvasEl] = useState<HTMLCanvasElement | null>(null)
   const [imgKey, setImgKey] = useState(0)
-  const [visible, setVisible] = useState(false)
   // 本图是否已改走服务端兜底通道（本机还原失败或设备已熔断）。
   const [useServer, setUseServer] = useState(false)
   // 原图尺寸：用于生成与真实渲染等高的 aspect-ratio 占位，加载/释放画布时滚动几何完全不变。
@@ -192,10 +232,14 @@ function DscImage({ src, serverSrc, comicId, scrambleId, index = 0, lazyAfter, f
   const loadTokenRef = useRef(0)
   const retriesRef = useRef(0)
   const releaseRef = useRef<(() => void) | null>(null)
-  // 供模块级存活表判断「这张画布是否还在视口内」，避免逐出用户正在看的图。
-  const visibleRef = useRef(false)
-  visibleRef.current = visible
-  // lazyAfter/index 仅用于保持调用方签名（实际门控由 IntersectionObserver 的 ±3000px 带完成）。
+  // 当前是否应当持有画布：keepElement() 的缓存结果，供模块级存活表判断
+  // 「这张画布是否还在保留范围内」，避免逐出用户正在看/刚看过的图。
+  const keepRef = useRef(true)
+  // 供共享节拍回调读取最新状态，避免闭包读到旧值。
+  const phaseRef = useRef<Phase>('idle')
+  phaseRef.current = phase
+  const releaseCurrentRef = useRef<(() => void) | null>(null)
+  // lazyAfter/index 仅用于保持调用方签名（实际门控由 keepElement() 的保留范围完成）。
   void lazyAfter
   void index
 
@@ -203,15 +247,22 @@ function DscImage({ src, serverSrc, comicId, scrambleId, index = 0, lazyAfter, f
   // 熔断后新进入的图片直接走服务端；没有兜底地址时只能继续尝试本机还原。
   const servedByServer = Boolean(serverSrc) && (useServer || canvasDisabled)
 
-  // 视口门控：进入 ±3000px 带内才持有实体，离开则释放画布位图，回来再还原。
-  useEffect(() => {
-    const el = holderRef.current
-    if (!el) {
-      setVisible(true)
+  // 视口门控：进入保留范围才持有实体，离开则释放画布位图，回来再还原。
+  // 判定与释放共用 keepElement()，二者互斥，因此不会抖动。
+  const evaluate = useCallback(() => {
+    const keep = keepElement(holderRef.current)
+    keepRef.current = keep
+    if (keep) {
+      if (phaseRef.current === 'idle') setPhase('loading')
       return
     }
-    return observeVisibility(el, setVisible)
+    if (phaseRef.current === 'done') releaseCurrentRef.current?.()
   }, [])
+
+  useEffect(() => {
+    evaluate()
+    return subscribeTick(evaluate)
+  }, [evaluate])
 
   // 释放当前持有画布：回到占位态，等再次进入视口时重新还原。
   // 统一走 release()，这样「离开视口」这条最常见的路径也会在 DOM 摘除后立刻清空位图
@@ -229,11 +280,10 @@ function DscImage({ src, serverSrc, comicId, scrambleId, index = 0, lazyAfter, f
     setPhase('idle')
   }, [])
 
-  // 离开视口后释放位图，避免 canvas 位图随阅读进度无限累积。
-  useEffect(() => {
-    if (visible || phase !== 'done') return
-    if (canvasEl) releaseCurrent()
-  }, [visible, phase, canvasEl, releaseCurrent])
+  // 离开保留范围后释放位图，避免 canvas 位图随阅读进度无限累积。
+  // （由 evaluate 统一驱动：保留 → 载入，不保留 → 释放。）
+  // 直接同步赋值而不是放进 effect：evaluate 可能在 effect 之前就被共享节拍调用。
+  releaseCurrentRef.current = releaseCurrent
 
   const cutImage = useCallback(
     (image: HTMLImageElement, token: number): boolean => {
@@ -302,11 +352,10 @@ function DscImage({ src, serverSrc, comicId, scrambleId, index = 0, lazyAfter, f
     [src, comicId, scrambleId],
   )
 
+  // 自身几何变化（解码完成、占位换成实体）会改变保留范围，需要重算一次。
   useEffect(() => {
-    if (phase === 'idle' && visible) {
-      setPhase('loading')
-    }
-  }, [phase, visible])
+    evaluate()
+  }, [evaluate, natW, natH])
 
   useEffect(() => {
     if (phase !== 'loading') return
@@ -375,7 +424,7 @@ function DscImage({ src, serverSrc, comicId, scrambleId, index = 0, lazyAfter, f
     }
     image.src = url
     return cleanup
-  }, [phase, visible, imgKey, src, serverSrc, needDescramble, servedByServer, cutImage])
+  }, [phase, imgKey, src, serverSrc, needDescramble, servedByServer, cutImage])
 
   // 组件卸载或换页时使进行中的任务失效，并释放持有的画布。
   useEffect(() => {
@@ -413,9 +462,12 @@ function DscImage({ src, serverSrc, comicId, scrambleId, index = 0, lazyAfter, f
     retainCanvas({
       release,
       bytes: canvasEl.width * canvasEl.height * 4,
-      active: () => visibleRef.current,
+      active: () => keepRef.current,
       distance: () => viewportDistance(holderRef.current),
     })
+    // 解码期间可能已经滚远（长章节里很常见）：挂上时就不在保留范围内的话立刻回退，
+    // 免得这张位图要等到下一次滚动才被回收。
+    if (!keepRef.current) release()
     return () => {
       dropCanvas(release)
       if (releaseRef.current === release) releaseRef.current = null

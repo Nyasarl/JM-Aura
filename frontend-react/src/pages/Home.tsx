@@ -1,6 +1,7 @@
-import { Fragment } from 'react'
+import { Fragment, useCallback } from 'react'
 import { Link as RouterLink } from 'react-router-dom'
 import Box from '@mui/material/Box'
+import CircularProgress from '@mui/material/CircularProgress'
 import Button from '@mui/material/Button'
 import Card from '@mui/material/Card'
 import CardContent from '@mui/material/CardContent'
@@ -9,15 +10,15 @@ import MenuBookIcon from '@mui/icons-material/MenuBook'
 import PlayArrowIcon from '@mui/icons-material/PlayArrow'
 import Typography from '@mui/material/Typography'
 import { api, imgUrl } from '../api'
-import { appLink, sourceFromPath, sourcePath, type SourceKind } from '../source'
+import { sourceFromPath, sourcePath, type SourceKind } from '../source'
 import {
   CenterLoading,
   ComicCoverRow,
   ErrorState,
-  MoreTile,
   NovelCard,
   SectionTitle,
   useAsync,
+  useRowInfinite,
 } from '../components'
 import type { ComicSummary, NovelSummary } from '../types'
 import { useAuth } from '../auth'
@@ -103,6 +104,8 @@ interface PromoteSection {
   title?: string
   slug?: string
   type?: string
+  /** category_id 类型分区的分类号（promote/library/novels 为空或不存在） */
+  filter_val?: number | string | null
   content?: unknown[]
 }
 
@@ -236,13 +239,17 @@ function ContinueReading() {
   )
 }
 
+// 模块级稳定 key（同 ComicCoverRow 的理由：避免每帧重建观察器）。
+const novelRowKey = (n: NovelSummary) => `${n.source}-${n.novel_id}`
+
 function NovelCoverRow({
   items,
-  more,
+  loadMore,
 }: {
   items: NovelSummary[]
-  more?: { to: string; label?: string }
+  loadMore?: (page: number) => Promise<NovelSummary[]>
 }) {
+  const { shown, loading, sentinelRef } = useRowInfinite(items, novelRowKey, loadMore)
   if (items.length === 0) return null
   return (
     <Box
@@ -262,7 +269,7 @@ function NovelCoverRow({
         pb: 1,
       }}
     >
-      {items.map((n) => (
+      {shown.map((n) => (
         <Box
           key={`${n.source}-${n.novel_id}`}
           sx={{ flex: '0 0 auto', width: { xs: 108, sm: 128 }, scrollSnapAlign: 'start' }}
@@ -270,13 +277,82 @@ function NovelCoverRow({
           <NovelCard novel={n} />
         </Box>
       ))}
-      {more ? <MoreTile to={more.to} label={more.label} /> : null}
+      {loadMore ? (
+        <>
+          {loading ? (
+            <Box
+              sx={{
+                flex: '0 0 auto',
+                width: { xs: 108, sm: 128 },
+                minHeight: 120,
+                display: 'flex',
+                alignItems: 'center',
+                justifyContent: 'center',
+              }}
+            >
+              <CircularProgress size={22} thickness={4} />
+            </Box>
+          ) : null}
+          <Box ref={sentinelRef} sx={{ flex: '0 0 auto', width: '1px', alignSelf: 'stretch' }} />
+        </>
+      ) : null}
     </Box>
+  )
+}
+
+/** 分类分区（type=category_id）的续接：JM 的 `/categories/filter` 就是该分类的最新列表，
+ *  后端已暴露为 /api/v2/{source}/leaderboard，80 条一页，不需要新增接口。
+ *  注意：上游 /promote 只给每个分区固定的一批（漫画 30 条）且不接受任何分页参数，
+ *  所以只有 category_id 类型的分区能真正「继续加载」，其余分区就停在已有条目上。 */
+async function loadCategoryPage(source: SourceKind, category: string, page: number): Promise<ComicSummary[]> {
+  const d = await api.get<unknown>(`/api/v2/${source}/leaderboard${api.qs({ category, sort: 'mr', page })}`)
+  return Array.isArray(d) ? (d as ComicSummary[]) : []
+}
+
+/** 小说分区的续接：/promote 的 page 参数只对小说分区有效（每页多 6 条）。 */
+async function loadPromoteNovelsPage(page: number): Promise<NovelSummary[]> {
+  const d = await api.get<unknown>(`/api/promote${api.qs({ page })}`)
+  const sections = normalizeSections(d)
+  const sec = sections.find((s) => s.type === 'novels') ?? sections.find((s) => String(s.id) === '1002')
+  return sec ? novelListFromPromote(sec.content) : []
+}
+
+/** 单个推荐分区。单独抽成组件是为了能按分区 memo 出稳定的 loadMore（不然每次渲染
+ *  都会换函数身份，导致行尾哨兵的观察器反复重建）。 */
+function PromoteBlock({ section, source }: { section: PromoteSection; source: SourceKind }) {
+  const novels = novelListFromPromote(section.content)
+  const novelIds = new Set(novels.map((n) => n.novel_id))
+  const comics = rawListToSummaries(section.content).filter((c) => !novelIds.has(c.comic_id))
+  const fv = section.filter_val
+  const category = section.type === 'category_id' && fv !== undefined && fv !== null ? String(fv) : ''
+  const loadMoreComics = useCallback(
+    (page: number) => (category ? loadCategoryPage(source, category, page) : Promise.resolve([])),
+    [source, category],
+  )
+  if (novels.length === 0 && comics.length === 0) return null
+  return (
+    <Fragment>
+      {novels.length > 0 ? (
+        <Box sx={{ mb: 3.5 }}>
+          <SectionTitle>
+            <MenuBookIcon sx={{ color: 'primary.main' }} /> {section.title || '编辑推荐'}
+          </SectionTitle>
+          <NovelCoverRow items={novels} loadMore={source === 'bika' ? undefined : loadPromoteNovelsPage} />
+        </Box>
+      ) : null}
+      {comics.length > 0 ? (
+        <Box sx={{ mb: 3.5 }}>
+          <SectionTitle>{section.title || '编辑推荐'}</SectionTitle>
+          <ComicCoverRow items={comics} loadMore={category ? loadMoreComics : undefined} />
+        </Box>
+      ) : null}
+    </Fragment>
   )
 }
 
 export default function Home() {
   const promote = useAsync(loadPromote, [])
+  const source = sourceFromPath()
 
   return (
     <Box>
@@ -292,44 +368,7 @@ export default function Home() {
           // 禁漫書庫（type=library）内容为创作者作品集，既非漫画也非小说，
           // 且其缩略图资源上游已失效；直接跳过，避免渲染成点击后跳到错误作品的卡片。
           if (section.type === 'library') return null
-          const novels = novelListFromPromote(section.content)
-          const novelIds = new Set(novels.map((n) => n.novel_id))
-          const comics = rawListToSummaries(section.content).filter((c) => !novelIds.has(c.comic_id))
-          if (novels.length === 0 && comics.length === 0) return null
-          return (
-            <Fragment key={key}>
-              {novels.length > 0 ? (
-                <Box sx={{ mb: 3.5 }}>
-                  <SectionTitle>
-                    <MenuBookIcon sx={{ color: 'primary.main' }} /> {section.title || '编辑推荐'}
-                  </SectionTitle>
-                  <NovelCoverRow
-                    items={novels}
-                    more={
-                      // 目标页必须存在于「当前源」：哔咔源没有 /novels。
-                      sourceFromPath() === 'bika'
-                        ? undefined
-                        : { to: appLink('/novels'), label: '全部小说' }
-                    }
-                  />
-                </Box>
-              ) : null}
-              {comics.length > 0 ? (
-                <Box sx={{ mb: 3.5 }}>
-                  <SectionTitle>{section.title || '编辑推荐'}</SectionTitle>
-                  <ComicCoverRow
-                    items={comics}
-                    // 行本身没有分页接口，只给出口：能翻页的完整列表页；
-                    // 哔咔源没有 /latest，退回分类页，保证链接不会点空。
-                    more={{
-                      to: appLink(sourceFromPath() === 'bika' ? '/categories' : '/latest'),
-                      label: '更多',
-                    }}
-                  />
-                </Box>
-              ) : null}
-            </Fragment>
-          )
+          return <PromoteBlock key={key} section={section} source={source} />
         })
       )}
     </Box>
