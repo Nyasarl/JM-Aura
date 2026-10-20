@@ -12,6 +12,8 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -181,9 +183,9 @@ func Wrap(h http.Handler) http.Handler {
 		}()
 		bw := &bufWriter{rw: w, accepts: acceptsGzip(r)}
 		defer bw.finish()
-		var inner http.Handler
 		if middlewareAllowPath(r.URL.Path) {
-			inner = h
+			h.ServeHTTP(bw, r)
+			return
 		} else {
 			u, isAuth, newGid := store.EffectiveUser(r)
 			onlineTouch(u)
@@ -201,17 +203,53 @@ func Wrap(h http.Handler) http.Handler {
 					MaxAge:   365 * 86400,
 				})
 			}
-			inner = h
+			h.ServeHTTP(bw, r)
 		}
-		gz := &gzipMiddleware{next: inner}
-		gz.ServeHTTP(bw, r)
 	})
 }
 
 const gzipMinSize = 800
 
 func acceptsGzip(r *http.Request) bool {
-	return strings.Contains(strings.ToLower(r.Header.Get("Accept-Encoding")), "gzip")
+	return acceptsEncoding(r, "gzip")
+}
+
+// acceptsEncoding 判断客户端是否接受指定的 Content-Encoding。
+// 正确解析 q 值：「gzip;q=0」表示明确不接受，不能当成接受。
+func acceptsEncoding(r *http.Request, enc string) bool {
+	for _, part := range strings.Split(r.Header.Get("Accept-Encoding"), ",") {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		name, params, _ := strings.Cut(part, ";")
+		if !strings.EqualFold(strings.TrimSpace(name), enc) {
+			continue
+		}
+		q := 1.0
+		for _, p := range strings.Split(params, ";") {
+			p = strings.TrimSpace(p)
+			if v, ok := strings.CutPrefix(p, "q="); ok {
+				if f, err := strconv.ParseFloat(strings.TrimSpace(v), 64); err == nil {
+					q = f
+				}
+			}
+		}
+		return q > 0
+	}
+	return false
+}
+
+// addVary 追加 Vary 头，已存在同名字段时不重复添加。
+func addVary(hdr http.Header, value string) {
+	for _, existing := range hdr.Values("Vary") {
+		for _, token := range strings.Split(existing, ",") {
+			if strings.EqualFold(strings.TrimSpace(token), value) {
+				return
+			}
+		}
+	}
+	hdr.Add("Vary", value)
 }
 
 type bufWriter struct {
@@ -255,13 +293,16 @@ func (b *bufWriter) decide(startGzip bool) {
 		hdr := b.rw.Header()
 		hdr.Del("Content-Length")
 		hdr.Set("Content-Encoding", "gzip")
-		hdr.Add("Vary", "Accept-Encoding")
+		addVary(hdr, "Accept-Encoding")
 		b.gzw = gzip.NewWriter(b.rw)
 		b.sink = b.gzw
 		b.useGzip = true
 	} else {
 		b.sink = b.rw
 	}
+	// 无论是否压缩都要声明 Vary：同一 URL 对不同客户端可能返回不同编码，
+	// 缺少 Vary 会让共享缓存把 gzip 版本发给不支持压缩的客户端。
+	addVary(b.rw.Header(), "Accept-Encoding")
 	st := b.status
 	if !b.statusSet {
 		st = 200
@@ -314,18 +355,13 @@ func (b *bufWriter) finish() {
 	b.decide(false)
 }
 
-type gzipMiddleware struct {
-	next http.Handler
-}
-
-func (g *gzipMiddleware) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	g.next.ServeHTTP(w, r)
-}
-
 type rateLimiter struct {
-	mu     sync.Mutex
-	hits   map[string][]time.Time
-	window time.Duration
+	mu        sync.Mutex
+	hits      map[string][]time.Time
+	order     []string // 键的插入顺序，用于 O(1) 淘汰最老的键
+	head      int
+	window    time.Duration
+	lastSweep time.Time
 }
 
 func newRateLimiter(window time.Duration) *rateLimiter {
@@ -336,7 +372,7 @@ func (l *rateLimiter) allow(key string, max int) bool {
 	now := time.Now()
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	arr := l.hits[key]
+	arr, known := l.hits[key]
 	keep := arr[:0]
 	for _, t := range arr {
 		if now.Sub(t) < l.window {
@@ -347,8 +383,64 @@ func (l *rateLimiter) allow(key string, max int) bool {
 		l.hits[key] = keep
 		return false
 	}
+	if !known {
+		// 新键：先把表压回上限以内，再放进来
+		l.evictIfFull()
+		l.order = append(l.order, key)
+	}
 	l.hits[key] = append(keep, now)
+	// 清理已经彻底过期的键：hits 只在对应客户端再次命中时才会被回收，
+	// 而键本身来自来访者 IP，长期运行会让这张 map 无限增长。
+	// 清扫最多一个窗口做一次，避免每个请求都扫全表。
+	if len(l.hits) > rateLimiterMaxKeys && now.Sub(l.lastSweep) >= l.window {
+		l.lastSweep = now
+		l.sweepLocked(now)
+	}
 	return true
+}
+
+// evictIfFull 表满时淘汰最老的键，保证限流表的大小始终有上界。
+// 调用方必须持有锁。
+func (l *rateLimiter) evictIfFull() {
+	for len(l.hits) >= rateLimiterMaxKeys && l.head < len(l.order) {
+		k := l.order[l.head]
+		l.head++
+		delete(l.hits, k)
+	}
+	// order 自己也不能无限增长，定期把已经消费掉的前缀丢掉
+	if l.head > 1024 && l.head*2 > len(l.order) {
+		l.order = append(l.order[:0], l.order[l.head:]...)
+		l.head = 0
+	}
+}
+
+// sweepLocked 清掉过期键；如果清完仍然超限，再按「最久没访问」淘汰，
+// 保证这张表的大小始终有上界。调用方必须持有锁。
+func (l *rateLimiter) sweepLocked(now time.Time) {
+	for k, ts := range l.hits {
+		if len(ts) == 0 || now.Sub(ts[len(ts)-1]) >= l.window {
+			delete(l.hits, k)
+		}
+	}
+	if len(l.hits) <= rateLimiterMaxKeys {
+		return
+	}
+	oldest := make([]string, 0, len(l.hits))
+	oldestAt := make(map[string]time.Time, len(l.hits))
+	for k, ts := range l.hits {
+		last := time.Time{}
+		if len(ts) > 0 {
+			last = ts[len(ts)-1]
+		}
+		oldest = append(oldest, k)
+		oldestAt[k] = last
+	}
+	sort.Slice(oldest, func(i, j int) bool {
+		return oldestAt[oldest[i]].Before(oldestAt[oldest[j]])
+	})
+	for i := 0; i < len(oldest) && len(l.hits) > rateLimiterMaxKeys; i++ {
+		delete(l.hits, oldest[i])
+	}
 }
 
 func remoteAddrKey(r *http.Request) string {
@@ -364,14 +456,34 @@ func remoteAddrKey(r *http.Request) string {
 	return host
 }
 
-var (
-	registerMu      sync.Mutex
-	registerClients = map[string]*http.Client{}
-)
-
 type promoteEntry struct {
 	exp  time.Time
 	body []byte
+}
+
+const (
+	promoteCacheTTL    = 5 * time.Second
+	promoteCacheMax    = 16      // 缓存条目上限，键空间归一化后本就很小
+	promoteCacheMaxLen = 4 << 20 // 单条正文上限，超大响应不入缓存
+	maxPageParam       = 100     // 分页参数上限，避免出现无意义的深层翻页
+	rateLimiterMaxKeys = 4096    // 限流表键数上限，超过后清理过期键
+)
+
+// normalizePageParam 归一化分页参数。上游只认数字页码，非法值一律回落到 0。
+// 这样缓存键就不会被用户可控的原始字符串撑成无限多个。
+func normalizePageParam(raw string) string {
+	s := strings.TrimSpace(raw)
+	if s == "" {
+		return "0"
+	}
+	n, err := strconv.Atoi(s)
+	if err != nil || n < 0 {
+		return "0"
+	}
+	if n > maxPageParam {
+		return strconv.Itoa(maxPageParam)
+	}
+	return strconv.Itoa(n)
 }
 
 var (
@@ -395,11 +507,32 @@ func promoteGet(page string) ([]byte, bool) {
 }
 
 func promotePut(page string, body []byte) {
+	if len(body) > promoteCacheMaxLen {
+		return
+	}
 	cp := make([]byte, len(body))
 	copy(cp, body)
 	promoteMu.Lock()
 	defer promoteMu.Unlock()
-	promoteCache[page] = promoteEntry{exp: time.Now().Add(5 * time.Second), body: cp}
+	now := time.Now()
+	// 顺手清掉过期条目：否则没人再访问的键会一直留在表里
+	for k, v := range promoteCache {
+		if now.After(v.exp) {
+			delete(promoteCache, k)
+		}
+	}
+	if _, exists := promoteCache[page]; !exists && len(promoteCache) >= promoteCacheMax {
+		// 满了就淘汰最接近过期的那条，保证新请求仍然能进缓存
+		oldestKey := ""
+		var oldestExp time.Time
+		for k, v := range promoteCache {
+			if oldestKey == "" || v.exp.Before(oldestExp) {
+				oldestKey, oldestExp = k, v.exp
+			}
+		}
+		delete(promoteCache, oldestKey)
+	}
+	promoteCache[page] = promoteEntry{exp: now.Add(promoteCacheTTL), body: cp}
 }
 
 func is401Err(err error) bool {

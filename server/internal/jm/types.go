@@ -130,21 +130,21 @@ type PhotoData struct {
 }
 
 type LoginResult struct {
-	UID               string     `json:"uid"`
-	Username          string     `json:"username"`
-	Email             string     `json:"email"`
-	Photo             string     `json:"photo"`
-	Gender            string     `json:"gender"`
-	Message           string     `json:"message"`
-	Coin              flexFloat  `json:"coin"`
-	AlbumFavorites    flexInt    `json:"album_favorites"`
-	S                 string     `json:"s"`
-	LevelName         string     `json:"level_name"`
-	Level             flexInt    `json:"level"`
-	NextLevelExp      flexInt    `json:"nextLevelExp"`
-	Exp               string     `json:"exp"`
-	ExpPercent        flexFloat  `json:"expPercent"`
-	AlbumFavoritesMax flexInt    `json:"album_favorites_max"`
+	UID               string    `json:"uid"`
+	Username          string    `json:"username"`
+	Email             string    `json:"email"`
+	Photo             string    `json:"photo"`
+	Gender            string    `json:"gender"`
+	Message           string    `json:"message"`
+	Coin              flexFloat `json:"coin"`
+	AlbumFavorites    flexInt   `json:"album_favorites"`
+	S                 string    `json:"s"`
+	LevelName         string    `json:"level_name"`
+	Level             flexInt   `json:"level"`
+	NextLevelExp      flexInt   `json:"nextLevelExp"`
+	Exp               string    `json:"exp"`
+	ExpPercent        flexFloat `json:"expPercent"`
+	AlbumFavoritesMax flexInt   `json:"album_favorites_max"`
 }
 
 type CommentData struct {
@@ -184,10 +184,10 @@ type NovelItem struct {
 }
 
 type NovelPage struct {
-	SearchQuery string       `json:"search_query"`
-	Total       json.Number  `json:"total"`
-	RedirectAid string       `json:"redirect_aid"`
-	Content     []NovelItem  `json:"content"`
+	SearchQuery string      `json:"search_query"`
+	Total       json.Number `json:"total"`
+	RedirectAid string      `json:"redirect_aid"`
+	Content     []NovelItem `json:"content"`
 }
 
 type NovelSeriesEntry struct {

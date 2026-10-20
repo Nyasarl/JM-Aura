@@ -5,7 +5,8 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
-    "build": "tsc --noEmit && vite build",
+    "build": "tsc --noEmit && vite build && node scripts/precompress.mjs ../server/internal/app/webdist",
+    "precompress": "node scripts/precompress.mjs ../server/internal/app/webdist",
     "preview": "vite preview"
   },
   "dependencies": {

@@ -6,7 +6,10 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"os/signal"
 	"strings"
+	"syscall"
+	"time"
 
 	"jmaura/internal/app"
 )
@@ -52,7 +55,35 @@ func main() {
 		log.Printf("上游连接预热完成")
 	}()
 
-	if err := http.ListenAndServe(addr, app.Wrap(app.NewRouter())); err != nil {
+	srv := &http.Server{
+		Addr:    addr,
+		Handler: app.Wrap(app.NewRouter()),
+		// 读请求头超时：挡掉慢速头攻击（slowloris），否则连接会被长期占住
+		ReadHeaderTimeout: 10 * time.Second,
+		// 读请求体超时：请求体都很小（没有文件上传），不需要更久
+		ReadTimeout: 30 * time.Second,
+		// 写超时留空：图片代理与下载是长连接流式响应，写死会误伤慢速客户端
+		IdleTimeout:    120 * time.Second,
+		MaxHeaderBytes: 1 << 20,
+	}
+
+	// 优雅退出：容器滚动更新时先停止接收新连接，等在途请求处理完再退出，
+	// 避免部署瞬间把用户正在用的请求打断成 502。
+	stop := make(chan os.Signal, 1)
+	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
+	go func() {
+		<-stop
+		log.Printf("收到退出信号，开始优雅关闭")
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if err := srv.Shutdown(ctx); err != nil {
+			log.Printf("优雅关闭超时，强制关闭: %v", err)
+			_ = srv.Close()
+		}
+	}()
+
+	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		log.Fatal(err)
 	}
+	log.Printf("服务已退出")
 }

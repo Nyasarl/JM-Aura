@@ -149,6 +149,10 @@ func registerSPA(mux *http.ServeMux) {
 			if strings.HasPrefix(p, "assets/") {
 				w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
 			}
+			// 命中构建期生成的 .br / .gz 就直接下发，省掉运行时压缩
+			if servePrecompressed(w, r, sub, p) {
+				return
+			}
 			files.ServeHTTP(w, r)
 			return
 		}

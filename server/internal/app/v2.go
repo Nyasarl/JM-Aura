@@ -195,11 +195,20 @@ func handleV2Logout(w http.ResponseWriter, r *http.Request) {
 	v2OK(w, map[string]any{"ok": true})
 }
 
+// v2MaxBody 是 v2 接口允许的请求体上限。这些接口全是 JSON 载荷
+// （登录/注册/资料/评论），正常只有几百字节；不设上限的话，
+// 一个超大请求就能把内存吃光。
+const v2MaxBody = 1 << 20
+
 // v2DecodeBody emulates FastAPI body validation happening before the handler.
 func v2DecodeBody(w http.ResponseWriter, r *http.Request, dst any) bool {
-	body, err := io.ReadAll(r.Body)
+	body, err := io.ReadAll(io.LimitReader(r.Body, v2MaxBody+1))
 	if err != nil {
 		httpDetail(w, 422, err.Error())
+		return false
+	}
+	if len(body) > v2MaxBody {
+		httpDetail(w, 422, "Request body too large")
 		return false
 	}
 	if len(bytes.TrimSpace(body)) == 0 {

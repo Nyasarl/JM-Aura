@@ -12,9 +12,24 @@ export default defineConfig({
     chunkSizeWarningLimit: 1500,
     rollupOptions: {
       output: {
-        manualChunks: {
-          vendor: ['react', 'react-dom', 'react-router-dom'],
-          mui: ['@mui/material', '@mui/icons-material', '@emotion/react', '@emotion/styled'],
+        // 只把 React 运行时单独切出来：它几乎每个页面都要用，独立成块后
+        // 内容哈希稳定，可以长期缓存。
+        //
+        // MUI 之前是整包进一个 manual chunk（@mui/material + @mui/icons-material），
+        // 结果是只有懒加载页面才会用到的组件与图标也被塞进首屏，
+        // 首屏 JS 一度达到 386KB（gzip 后 116KB）。交给 Rollup 自动分块后，
+        // 首屏只带真正立刻用得上的 MUI 部分，其余跟着页面按需下载。
+        manualChunks(id) {
+          if (!id.includes('node_modules')) return
+          if (
+            id.includes('node_modules/react/') ||
+            id.includes('node_modules/react-dom/') ||
+            id.includes('node_modules/scheduler/') ||
+            id.includes('node_modules/react-router/') ||
+            id.includes('node_modules/react-router-dom/')
+          ) {
+            return 'react-vendor'
+          }
         },
       },
     },

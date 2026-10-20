@@ -173,10 +173,7 @@ func favoriteQuery(page int, fid string) url.Values {
 }
 
 func handlePromote(w http.ResponseWriter, r *http.Request) {
-	page := r.URL.Query().Get("page")
-	if page == "" {
-		page = "0"
-	}
+	page := normalizePageParam(r.URL.Query().Get("page"))
 	var raw []byte
 	if body, has := promoteGet(page); has {
 		raw = body
@@ -199,10 +196,7 @@ func handlePromote(w http.ResponseWriter, r *http.Request) {
 }
 
 func handleLatest(w http.ResponseWriter, r *http.Request) {
-	page := r.URL.Query().Get("page")
-	if page == "" {
-		page = "0"
-	}
+	page := normalizePageParam(r.URL.Query().Get("page"))
 	ck := store.LoadCookies(effIdentityOf(r))
 	res, err := apiClient().Latest(r.Context(), page, ck)
 	if err != nil {
