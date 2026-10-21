@@ -192,6 +192,9 @@ func handlePromote(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 200, json.RawMessage(raw))
 		return
 	}
+	// 补齐封面地址并后台预热：用户滚动到某一行时，封面通常已经在缓存里，
+	// 命中即返回，而不是等用户滚到了才开始抓。
+	prewarmCovers(fillCoverImages(data))
 	writeJSON(w, 200, v2MaskLegacy(r, data, true))
 }
 

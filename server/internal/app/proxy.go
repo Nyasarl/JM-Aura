@@ -191,7 +191,17 @@ func webpDisplayRGB(img image.Image) image.Image {
 
 // imgDownscale 把图片缩到 maxW 宽（仅缩小）。无需缩放或解码失败时 ok=false。
 func imgDownscale(raw []byte, maxW int) (data []byte, ct string, ok bool) {
-	src, format, err := image.Decode(bytes.NewReader(raw))
+	// 先只读图片头判断尺寸：源图不比目标大就没必要整幅解码。
+	// 纯 Go 解一张 WebP 要 100~300ms CPU（这台部署机只有 2 核），
+	// 解完再扔掉是白付。
+	cfg, format, err := image.DecodeConfig(bytes.NewReader(raw))
+	if err != nil {
+		return nil, "", false
+	}
+	if cfg.Width <= 0 || cfg.Height <= 0 || cfg.Width <= maxW {
+		return nil, "", false
+	}
+	src, _, err := image.Decode(bytes.NewReader(raw))
 	if err != nil {
 		return nil, "", false
 	}
@@ -203,7 +213,7 @@ func imgDownscale(raw []byte, maxW int) (data []byte, ct string, ok bool) {
 	}
 	b := src.Bounds()
 	sw, sh := b.Dx(), b.Dy()
-	if sw <= 0 || sh <= 0 || sw <= maxW {
+	if sw <= 0 || sh <= 0 {
 		return nil, "", false
 	}
 	dw := maxW
@@ -240,15 +250,41 @@ func imgDownscale(raw []byte, maxW int) (data []byte, ct string, ok bool) {
 	return buf.Bytes(), ct, true
 }
 
-func writeImage(w http.ResponseWriter, ct string, data []byte) {
+// writeImage 回发图片内容。
+//
+// 缩略图的 URL 里带着上游地址与目标宽度，内容实际不可变，因此给足缓存
+// （7 天 + immutable）并附上 ETag：浏览器在缓存过期后可以走条件请求，
+// 拿到 304 而不是重新下载几十 KB 图片。
+func writeImage(w http.ResponseWriter, r *http.Request, ct string, data []byte) {
 	if ct == "" {
 		ct = "image/jpeg"
 	}
+	etag := coverETag(data)
 	w.Header().Set("Content-Type", ct)
-	w.Header().Set("Cache-Control", "public, max-age=86400")
+	w.Header().Set("Cache-Control", "public, max-age="+strconv.Itoa(coverCacheSeconds)+", immutable")
+	w.Header().Set("ETag", etag)
+	if inm := r.Header.Get("If-None-Match"); inm != "" && etagMatch(inm, etag) {
+		w.WriteHeader(http.StatusNotModified)
+		return
+	}
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write(data)
 }
+
+// etagMatch 判断 If-None-Match 是否命中（支持 * 与逗号分隔的列表）。
+func etagMatch(header, etag string) bool {
+	for _, part := range strings.Split(header, ",") {
+		part = strings.TrimSpace(part)
+		if part == "*" || part == etag {
+			return true
+		}
+	}
+	return false
+}
+
+// imageProxyAllowPrivateHosts 仅供测试使用：放开图片代理对内网地址的拦截，
+// 好让测试能用本地 httptest 上游跑通整条链路。生产恒为 false。
+var imageProxyAllowPrivateHosts = false
 
 func handleImageProxy(w http.ResponseWriter, r *http.Request) {
 	raw := r.URL.Query().Get("url")
@@ -266,7 +302,7 @@ func handleImageProxy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	host := strings.ToLower(u.Hostname())
-	if host == "localhost" || host == "127.0.0.1" || host == "::1" || strings.HasPrefix(host, "192.168.") {
+	if !imageProxyAllowPrivateHosts && (host == "localhost" || host == "127.0.0.1" || host == "::1" || strings.HasPrefix(host, "192.168.")) {
 		httpDetail(w, 403, "Access denied")
 		return
 	}
@@ -280,59 +316,77 @@ func handleImageProxy(w http.ResponseWriter, r *http.Request) {
 	if width > 0 {
 		cacheKey = strconv.Itoa(width) + "|" + raw
 		if data, ct, hit := imgThumbs.get(cacheKey); hit {
-			writeImage(w, ct, data)
+			writeImage(w, r, ct, data)
 			return
 		}
 	}
-	ref := "https://jmcomic.me/"
-	if u.Scheme != "" && u.Host != "" {
-		ref = u.Scheme + "://" + u.Host + "/"
-	}
-	req, rerr := http.NewRequestWithContext(r.Context(), http.MethodGet, raw, nil)
-	if rerr != nil {
-		httpDetail(w, 500, rerr.Error())
+
+	if width > 0 {
+		// 缩略图：合并同一张封面的并发请求，并按目标宽度挑变体、失败时换镜像域名。
+		body, ct, _, err := coverFlightDo(r.Context(), cacheKey, func(ctx context.Context) ([]byte, string, int, error) {
+			b, c, ferr := coverFetchBody(ctx, u, width, false)
+			if ferr != nil {
+				return nil, "", 0, ferr
+			}
+			return b, c, http.StatusOK, nil
+		})
+		if err != nil || len(body) == 0 {
+			httpDetail(w, http.StatusBadGateway, "Image fetch failed")
+			return
+		}
+		// 只有明显偏大才缩放；源图本来就够小的话原样透传更划算
+		//（更小、更清晰，还省掉一次整幅解码 + 重编码）。
+		if coverNeedsScale(body, width) {
+			if out, oct, ok := imgDownscale(body, width); ok {
+				imgThumbs.put(cacheKey, out, oct)
+				writeImage(w, r, oct, out)
+				return
+			}
+		}
+		// 原样缓存并回发。
+		imgThumbs.put(cacheKey, body, ct)
+		writeImage(w, r, ct, body)
 		return
 	}
-	req.Header.Set("Referer", ref)
-	req.Header.Set("User-Agent", chrome120UA)
-	resp, ferr := proxyClientVerify.Do(req)
-	if ferr != nil {
-		// 部分第三方图源（如哔咔的 diwodiwo 系列 CDN）证书链不完整，
-		// 严格校验会失败；此处回退到免校验客户端，避免整站图片挂掉。
-		req2, rerr2 := http.NewRequestWithContext(r.Context(), http.MethodGet, raw, nil)
-		if rerr2 != nil {
-			httpDetail(w, 500, ferr.Error())
-			return
+
+	// 原图：流式回发，域名失效时自动换镜像重试。
+	for _, cand := range coverCandidates(u, 0) {
+		resp, err := openImageStream(r.Context(), cand)
+		if err != nil {
+			continue
 		}
-		req2.Header.Set("Referer", ref)
-		req2.Header.Set("User-Agent", chrome120UA)
-		resp, ferr = proxyClientNoVerify.Do(req2)
-		if ferr != nil {
-			httpDetail(w, 500, ferr.Error())
-			return
+		if resp.StatusCode != http.StatusOK {
+			drainClose(resp)
+			continue
 		}
-	}
-	defer drainClose(resp)
-	if resp.StatusCode != http.StatusOK {
-		httpDetail(w, resp.StatusCode, "Image fetch failed")
-		return
-	}
-	if width <= 0 {
 		streamImageResponse(w, resp, "public, max-age=86400")
 		return
 	}
-	body, rerr2 := io.ReadAll(io.LimitReader(resp.Body, imgThumbMaxBody))
-	if rerr2 != nil {
-		writeImage(w, resp.Header.Get("Content-Type"), body)
-		return
+	httpDetail(w, http.StatusBadGateway, "Image fetch failed")
+}
+
+// openImageStream 向上游发起一次取图请求。
+// 部分第三方图源（如哔咔的 diwodiwo 系列 CDN）证书链不完整，
+// 严格校验会失败；此处回退到免校验客户端，避免整站图片挂掉。
+func openImageStream(ctx context.Context, raw string) (*http.Response, error) {
+	ref := "https://jmcomic.me/"
+	if u, err := url.Parse(raw); err == nil && u.Scheme != "" && u.Host != "" {
+		ref = u.Scheme + "://" + u.Host + "/"
 	}
-	if out, ct, ok := imgDownscale(body, width); ok {
-		imgThumbs.put(cacheKey, out, ct)
-		writeImage(w, ct, out)
-		return
+	send := func(client *http.Client) (*http.Response, error) {
+		req, rerr := http.NewRequestWithContext(ctx, http.MethodGet, raw, nil)
+		if rerr != nil {
+			return nil, rerr
+		}
+		req.Header.Set("Referer", ref)
+		req.Header.Set("User-Agent", chrome120UA)
+		return client.Do(req)
 	}
-	// 解码失败或本就够小：原样回发已读字节。
-	writeImage(w, resp.Header.Get("Content-Type"), body)
+	resp, err := send(proxyClientVerify)
+	if err != nil {
+		return send(proxyClientNoVerify)
+	}
+	return resp, nil
 }
 
 // —— 在线阅读图片解码 ——
