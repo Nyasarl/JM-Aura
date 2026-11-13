@@ -109,6 +109,7 @@ const JM_PAGES: Array<[string, ReactNode]> = [
 const BIKA_PAGES: Array<[string, ReactNode]> = [
   ['search', <Search />],
   ['categories', <Categories />],
+  ['leaderboard', <Leaderboard />],
   ['random', <RandomPage />],
   ['comic/:comicId', <ComicDetail />],
   ['reader/:chapterId', <Reader />],
