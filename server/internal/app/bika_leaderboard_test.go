@@ -5,7 +5,9 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"sync"
 	"testing"
+	"time"
 
 	"jmaura/internal/bika"
 	"jmaura/internal/provider"
@@ -24,8 +26,21 @@ func withBikaUpstream(t *testing.T, h http.HandlerFunc) {
 	t.Cleanup(func() {
 		bikaClient = oldClient
 		bikaPublicToken = oldToken
+		// 包级缓存必须清掉，否则用例之间互相污染
+		bikaLeaderboardMu.Lock()
+		bikaLeaderboardTable = map[string]bikaLeaderboardEntry{}
+		bikaLeaderboardFly = map[string]*bikaLeaderboardFlight{}
+		bikaLeaderboardMu.Unlock()
 		ts.Close()
 	})
+}
+
+// resetLeaderboardCache 清空包级榜单缓存（用例间隔离）。
+func resetLeaderboardCache() {
+	bikaLeaderboardMu.Lock()
+	bikaLeaderboardTable = map[string]bikaLeaderboardEntry{}
+	bikaLeaderboardFly = map[string]*bikaLeaderboardFlight{}
+	bikaLeaderboardMu.Unlock()
 }
 
 // testLeaderboardPayload 模拟上游 comics/leaderboard 的响应：data.comics[] 定长列表。
@@ -43,7 +58,7 @@ func TestBikaLeaderboardPeriod(t *testing.T) {
 		want    string
 		wantErr bool
 	}{
-		{"", "H24", false},   // 不传默认 24 小时
+		{"", "H24", false}, // 不传默认 24 小时
 		{"H24", "H24", false},
 		{"D7", "D7", false},
 		{"d30", "D30", false}, // 大小写不敏感
@@ -180,4 +195,134 @@ func TestBikaLeaderboardInvalidPeriod(t *testing.T) {
 	if pe, ok := err.(*v2ProviderError); !ok || pe.status != 400 {
 		t.Errorf("期望 400 的 v2ProviderError，实际 %#v", err)
 	}
+}
+
+// TestBikaLeaderboardSingleFlight 冷缓存时 N 个并发请求只应打一次上游。
+func TestBikaLeaderboardSingleFlight(t *testing.T) {
+	resetLeaderboardCache()
+	var mu sync.Mutex
+	hits := 0
+
+	withBikaUpstream(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/auth/sign-in":
+			_, _ = io.WriteString(w, `{"code":200,"message":"ok","data":{"token":"tok-sf"}}`)
+		case "/comics/leaderboard":
+			mu.Lock()
+			hits++
+			mu.Unlock()
+			// 稍微延迟，让并发请求真的堆叠起来
+			time.Sleep(120 * time.Millisecond)
+			_, _ = io.WriteString(w, testLeaderboardPayload)
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	})
+	t.Setenv("BIKA_ACCOUNT", "pub@example.com")
+	t.Setenv("BIKA_PASSWORD", "secret")
+
+	p := bikaProvider{}
+	const n = 8
+	var wg sync.WaitGroup
+	errs := make([]error, n)
+	lens := make([]int, n)
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			raw, err := p.Leaderboard(context.Background(), "", provider.LeaderboardQuery{Period: "H24"})
+			errs[i] = err
+			if err == nil {
+				lens[i] = len(raw.([]v2ComicSummary))
+			}
+		}(i)
+	}
+	wg.Wait()
+
+	for i, err := range errs {
+		if err != nil {
+			t.Fatalf("并发请求 #%d 失败: %v", i, err)
+		}
+		if lens[i] != 2 {
+			t.Errorf("并发请求 #%d 条目数 = %d，期望 2", i, lens[i])
+		}
+	}
+	mu.Lock()
+	got := hits
+	mu.Unlock()
+	if got != 1 {
+		t.Errorf("上游被请求 %d 次，期望 1 次（single-flight 应合并并发）", got)
+	}
+}
+
+// TestBikaLeaderboardStaleWhileRevalidate 缓存过期后应立刻返回旧值，并在后台刷新。
+func TestBikaLeaderboardStaleWhileRevalidate(t *testing.T) {
+	resetLeaderboardCache()
+	var mu sync.Mutex
+	hits := 0
+	title := "旧榜单"
+
+	withBikaUpstream(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/auth/sign-in":
+			_, _ = io.WriteString(w, `{"code":200,"message":"ok","data":{"token":"tok-sw"}}`)
+		case "/comics/leaderboard":
+			mu.Lock()
+			hits++
+			cur := title
+			mu.Unlock()
+			_, _ = io.WriteString(w, `{"code":200,"message":"ok","data":{"comics":[
+			 {"_id":"x1","title":"`+cur+`","thumb":{"fileServer":"https://i.example/","path":"a.jpg"}}]}}`)
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	})
+	t.Setenv("BIKA_ACCOUNT", "pub@example.com")
+	t.Setenv("BIKA_PASSWORD", "secret")
+
+	p := bikaProvider{}
+	q := provider.LeaderboardQuery{Period: "H24"}
+	if _, err := p.Leaderboard(context.Background(), "", q); err != nil {
+		t.Fatalf("首次取榜单失败: %v", err)
+	}
+
+	// 人为把条目改成已过期
+	mu.Lock()
+	title = "新榜单"
+	hits = 0
+	mu.Unlock()
+	bikaLeaderboardMu.Lock()
+	e := bikaLeaderboardTable["H24:VC"]
+	e.exp = time.Now().Add(-time.Minute)
+	bikaLeaderboardTable["H24:VC"] = e
+	bikaLeaderboardMu.Unlock()
+
+	// 过期后第一次请求：应立刻拿到旧值（不等后台刷新）
+	start := time.Now()
+	raw, err := p.Leaderboard(context.Background(), "", q)
+	elapsed := time.Since(start)
+	if err != nil {
+		t.Fatalf("过期后取榜单失败: %v", err)
+	}
+	if got := raw.([]v2ComicSummary)[0].Title; got != "旧榜单" {
+		t.Errorf("过期瞬间应返回旧值，实际 %q", got)
+	}
+	if elapsed > 80*time.Millisecond {
+		t.Errorf("stale 兜底耗时 %v，应当立即返回而不等上游", elapsed)
+	}
+
+	// 后台刷新应该把新值写回缓存
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		bikaLeaderboardMu.Lock()
+		cur := bikaLeaderboardTable["H24:VC"]
+		bikaLeaderboardMu.Unlock()
+		if len(cur.items) > 0 && cur.items[0].Title == "新榜单" {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Error("后台刷新没有把新榜单写回缓存")
 }

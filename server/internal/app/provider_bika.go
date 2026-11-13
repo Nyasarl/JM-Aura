@@ -142,22 +142,99 @@ func (bikaProvider) Leaderboard(ctx context.Context, identity string, q provider
 	}
 	ct := bikaLeaderboardCategory(q.Category)
 	key := period + ":" + ct
-	if items, ok := bikaLeaderboardCached(key); ok {
+
+	items, fresh, ok := bikaLeaderboardLookup(key)
+	if ok && fresh {
 		return items, nil
 	}
+	if ok {
+		// 过期但有旧值：先把旧值给用户，后台悄悄刷新。
+		// 后台任务必须用独立 ctx——请求的 ctx 在响应结束时就取消了。
+		go bikaLeaderboardRefresh(key, period, ct, identity)
+		return items, nil
+	}
+
+	// 冷启动：同步取。并发请求由 single-flight 合并。
+	return bikaLeaderboardFetch(ctx, key, period, ct, identity)
+}
+
+// bikaLeaderboardFetch 同步取榜单，同一 key 的并发调用只会打一次上游。
+func bikaLeaderboardFetch(ctx context.Context, key, period, ct, identity string) ([]v2ComicSummary, error) {
+	bikaLeaderboardMu.Lock()
+	if f, running := bikaLeaderboardFly[key]; running {
+		bikaLeaderboardMu.Unlock()
+		select {
+		case <-f.done:
+			if f.err != nil {
+				return nil, f.err
+			}
+			return copyBikaSummaries(f.items), nil
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+	f := &bikaLeaderboardFlight{done: make(chan struct{})}
+	bikaLeaderboardFly[key] = f
+	bikaLeaderboardMu.Unlock()
+
+	items, err := bikaLeaderboardLoad(ctx, period, ct, identity)
+
+	bikaLeaderboardMu.Lock()
+	if err == nil {
+		bikaLeaderboardTable[key] = bikaLeaderboardEntry{
+			items: copyBikaSummaries(items),
+			exp:   time.Now().Add(bikaLeaderboardTTL),
+		}
+	}
+	f.items, f.err = items, err
+	close(f.done)
+	// 放在最后删除：close 与 delete 之间到达的请求会直接复用这个刚完成的结果。
+	if cur, still := bikaLeaderboardFly[key]; still && cur == f {
+		delete(bikaLeaderboardFly, key)
+	}
+	bikaLeaderboardMu.Unlock()
+
+	if err != nil {
+		return nil, err
+	}
+	return copyBikaSummaries(items), nil
+}
+
+// bikaLeaderboardRefresh 后台刷新（stale-while-revalidate）。已有刷新在跑时直接跳过，
+// 避免过期瞬间涌进来的每个请求都各起一个 goroutine。
+func bikaLeaderboardRefresh(key, period, ct, identity string) {
+	bikaLeaderboardMu.Lock()
+	if _, running := bikaLeaderboardFly[key]; running {
+		bikaLeaderboardMu.Unlock()
+		return
+	}
+	bikaLeaderboardMu.Unlock()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	// 刷新失败不影响任何人（旧值仍在缓存里，下次请求会再试一次）。
+	_, _ = bikaLeaderboardFetch(ctx, key, period, ct, identity)
+}
+
+// bikaLeaderboardLoad 真正打上游一次。
+func bikaLeaderboardLoad(ctx context.Context, period, ct, identity string) ([]v2ComicSummary, error) {
 	data, err := bikaCall(ctx, identity, func(t string) (any, error) {
 		return bikaClient.Leaderboard(ctx, t, period, ct)
 	})
 	if err != nil {
 		return nil, err
 	}
-	items := bikaSummaries(data)
-	bikaLeaderboardStore(key, items)
-	return copyBikaSummaries(items), nil
+	return bikaSummaries(data), nil
 }
 
-// 榜单缓存：榜单本身是「按时间段统计」的慢变量，App 端也缓存 15 分钟，
-// 这里取 10 分钟，避免用户反复切时间段时把上游打爆（哔咔对频率比较敏感）。
+// 榜单缓存：榜单是「按时间段统计」的慢变量（App 端也缓存 15 分钟），这里取 10 分钟。
+//
+// 三层保护，目标是「用户永远不需要等上游」：
+//  1. 命中且新鲜 → 直接返回（实测上游往返 ~226ms，命中 ~25ms）；
+//  2. 已过期但还有旧值 → 立即返回旧值，后台刷新（stale-while-revalidate），
+//     所以即使正好卡在过期瞬间，用户也不会看到延迟；
+//  3. 完全没有值（冷启动 / 刚换时间段）→ 同步取一次，并用 single-flight 合并
+//     瞬时并发：N 个用户同时打开榜单页只会打出 1 个上游请求。
 const bikaLeaderboardTTL = 10 * time.Minute
 
 type bikaLeaderboardEntry struct {
@@ -165,9 +242,17 @@ type bikaLeaderboardEntry struct {
 	exp   time.Time
 }
 
+// bikaLeaderboardFlight 是一次进行中的上游请求，供并发请求共享结果。
+type bikaLeaderboardFlight struct {
+	done  chan struct{}
+	items []v2ComicSummary
+	err   error
+}
+
 var (
 	bikaLeaderboardMu    sync.Mutex
 	bikaLeaderboardTable = map[string]bikaLeaderboardEntry{}
+	bikaLeaderboardFly   = map[string]*bikaLeaderboardFlight{}
 )
 
 // copyBikaSummaries 复制切片。必须复制：handler 里的 v2MaskList 用 items[:0] 原地
@@ -181,23 +266,16 @@ func copyBikaSummaries(in []v2ComicSummary) []v2ComicSummary {
 	return out
 }
 
-func bikaLeaderboardCached(key string) ([]v2ComicSummary, bool) {
+// bikaLeaderboardLookup 返回缓存条目。fresh 为 false 表示条目已过期但仍可用作
+// stale 兜底；ok 为 false 表示完全没有缓存。
+func bikaLeaderboardLookup(key string) (items []v2ComicSummary, fresh, ok bool) {
 	bikaLeaderboardMu.Lock()
-	e, ok := bikaLeaderboardTable[key]
+	e, found := bikaLeaderboardTable[key]
 	bikaLeaderboardMu.Unlock()
-	if !ok || time.Now().After(e.exp) {
-		return nil, false
+	if !found || len(e.items) == 0 {
+		return nil, false, false
 	}
-	return copyBikaSummaries(e.items), true
-}
-
-func bikaLeaderboardStore(key string, items []v2ComicSummary) {
-	bikaLeaderboardMu.Lock()
-	bikaLeaderboardTable[key] = bikaLeaderboardEntry{
-		items: copyBikaSummaries(items),
-		exp:   time.Now().Add(bikaLeaderboardTTL),
-	}
-	bikaLeaderboardMu.Unlock()
+	return copyBikaSummaries(e.items), time.Now().Before(e.exp), true
 }
 
 // —— 随机 / 每日精选 共用的抽取内核 ——
