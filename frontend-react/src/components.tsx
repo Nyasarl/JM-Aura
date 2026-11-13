@@ -186,7 +186,45 @@ export function SectionTitle({ children, action }: { children: ReactNode; action
   )
 }
 
-export function ComicCard({ comic }: { comic: ComicSummary }) {
+// 大数字口语化：12345 → 1.2万，方便在卡片上紧凑显示热度。
+function fmtCount(n: number): string {
+  if (n >= 100000000) return (n / 100000000).toFixed(1).replace(/\.0$/, '') + '亿'
+  if (n >= 10000) return (n / 10000).toFixed(1).replace(/\.0$/, '') + '万'
+  return String(n)
+}
+
+// 名次角标：前三名金银铜，其余半透明深底。压在封面上，所以固定深色底+白字，
+// 不用 backdrop-filter（移动端滤镜开销大）。
+function RankBadge({ rank }: { rank: number }) {
+  const medals = ['#f2b21b', '#c8d0d8', '#c9803f']
+  const top = rank <= 3
+  return (
+    <Box
+      sx={{
+        position: 'absolute',
+        top: 6,
+        left: 6,
+        minWidth: 26,
+        height: 26,
+        px: 0.75,
+        borderRadius: 1.5,
+        display: 'flex',
+        alignItems: 'center',
+        justifyContent: 'center',
+        fontSize: 14,
+        fontWeight: 800,
+        lineHeight: 1,
+        color: top ? '#1a1208' : '#fff',
+        bgcolor: top ? medals[rank - 1] : 'rgba(0,0,0,.62)',
+        boxShadow: 1,
+      }}
+    >
+      {rank}
+    </Box>
+  )
+}
+
+export function ComicCard({ comic, rank }: { comic: ComicSummary; rank?: number }) {
   return (
     <Card sx={{ height: '100%', transition: 'transform .18s ease, box-shadow .18s ease', '&:hover': { transform: 'translateY(-3px)', boxShadow: 8 } }}>
       <CardActionArea
@@ -229,6 +267,7 @@ export function ComicCard({ comic }: { comic: ComicSummary }) {
               📖
             </Box>
           )}
+          {rank ? <RankBadge rank={rank} /> : null}
         </Box>
         <Box sx={{ p: 1.25 }}>
           <Typography variant="body2" fontWeight={600} noWrap title={comic.title}>
@@ -239,6 +278,11 @@ export function ComicCard({ comic }: { comic: ComicSummary }) {
               {comic.author}
             </Typography>
           ) : null}
+          {comic.views ? (
+            <Typography variant="caption" color="text.secondary" noWrap display="block">
+              {fmtCount(comic.views)} 浏览
+            </Typography>
+          ) : null}
         </Box>
       </CardActionArea>
     </Card>
@@ -247,11 +291,11 @@ export function ComicCard({ comic }: { comic: ComicSummary }) {
 
 const GRID_COLUMNS = { xs: 'repeat(2, 1fr)', sm: 'repeat(3, 1fr)', md: 'repeat(4, 1fr)', lg: 'repeat(6, 1fr)' }
 
-export function ComicGrid({ items }: { items: ComicSummary[] }) {
+export function ComicGrid({ items, ranked }: { items: ComicSummary[]; ranked?: boolean }) {
   return (
     <Box sx={{ display: 'grid', gridTemplateColumns: GRID_COLUMNS, gap: 2 }}>
-      {items.map((c) => (
-        <ComicCard key={`${c.source}-${c.comic_id}`} comic={c} />
+      {items.map((c, i) => (
+        <ComicCard key={`${c.source}-${c.comic_id}`} comic={c} rank={ranked ? i + 1 : undefined} />
       ))}
     </Box>
   )

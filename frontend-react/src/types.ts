@@ -8,6 +8,9 @@ export interface ComicSummary {
   cover_url?: string | null
   tags: string[]
   category?: string | null
+  /** 热度：只有榜单类接口会带（哔咔排行榜的 totalViews / likesCount）。 */
+  views?: number | null
+  likes?: number | null
 }
 
 export interface ChapterSummary {

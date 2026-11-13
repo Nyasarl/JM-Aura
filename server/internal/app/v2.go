@@ -301,6 +301,10 @@ type v2ComicSummary struct {
 	Tags     []string       `json:"tags"`
 	Category *string        `json:"category"`
 	Raw      map[string]any `json:"raw"`
+	// Views / Likes 是「热度」，只有榜单类接口才填（哔咔排行榜带 totalViews/likesCount）。
+	// 普通列表不填，前端据此决定要不要展示热度徽标。
+	Views *int `json:"views,omitempty"`
+	Likes *int `json:"likes,omitempty"`
 }
 
 type v2ChapterSummary struct {
@@ -812,7 +816,14 @@ func handleV2Leaderboard(w http.ResponseWriter, r *http.Request) {
 		v2Fail(w, perr)
 		return
 	}
-	items, err := p.Leaderboard(r.Context(), effIdentityForRequest(r), category, page, sort, qp.Get("tag"))
+	// period 只对哔咔有意义（H24/D7/D30）；JM 忽略它，也允许前端不传。
+	items, err := p.Leaderboard(r.Context(), effIdentityForRequest(r), provider.LeaderboardQuery{
+		Category: category,
+		Page:     page,
+		Sort:     sort,
+		Tag:      qp.Get("tag"),
+		Period:   qp.Get("period"),
+	})
 	if err != nil {
 		v2Fail(w, err)
 		return

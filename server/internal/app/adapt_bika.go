@@ -85,6 +85,19 @@ func bikaSummaryWith(m map[string]any, pt bika.PictureType) v2ComicSummary {
 	if cats := bikaStrings(m["categories"]); len(cats) > 0 {
 		s.Category = v2StrPtr(cats[0])
 	}
+	// 热度：榜单类响应（comics/leaderboard）带 totalViews / totalLikes / likesCount，
+	// 普通列表没有这些字段，AsInt 会得到 0 —— 此时保持 nil，避免前端把 0 当成真实热度。
+	if v := bika.AsInt(m["totalViews"]); v > 0 {
+		views := v
+		s.Views = &views
+	}
+	likes := bika.AsInt(m["likesCount"])
+	if likes == 0 {
+		likes = bika.AsInt(m["totalLikes"])
+	}
+	if likes > 0 {
+		s.Likes = &likes
+	}
 	return s
 }
 

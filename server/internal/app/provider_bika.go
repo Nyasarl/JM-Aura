@@ -104,17 +104,100 @@ func (bikaProvider) Search(ctx context.Context, identity, keyword string, page i
 	return bikaSummaries(data), nil
 }
 
-func (bikaProvider) Leaderboard(ctx context.Context, identity, category string, page int, sort, tag string) (any, error) {
-	if page < 1 {
-		page = 1
+// bikaLeaderboardPeriods 是哔咔榜单支持的时间段，取自 App 端 LeaderboardTimeframe 枚举：
+// H24=24小时、D7=7天、D30=30天。
+var bikaLeaderboardPeriods = map[string]string{
+	"H24": "24小时",
+	"D7":  "7天",
+	"D30": "30天",
+}
+
+// bikaLeaderboardPeriod 规范时间段：空值默认 24 小时，不认识的值直接报错，
+// 而不是悄悄退回默认——否则前端传错参数时会看到「24小时」却以为在看别的榜单。
+func bikaLeaderboardPeriod(v string) (string, error) {
+	v = strings.ToUpper(strings.TrimSpace(v))
+	if v == "" {
+		return "H24", nil
+	}
+	if _, ok := bikaLeaderboardPeriods[v]; ok {
+		return v, nil
+	}
+	return "", v2ProviderErr("不支持的榜单时间段: "+v+"（可用 H24/D7/D30）", 400)
+}
+
+// bikaLeaderboardCategory 规范榜单类型。App 端 LeaderboardCategory 目前只有
+// VIEW_COUNT("VC","浏览榜") 这一项，所以前端传什么都按浏览榜处理；上游将来
+// 若新增类型（例如按爱心/按收藏），在这里补映射即可，接口签名不用动。
+func bikaLeaderboardCategory(string) string { return "VC" }
+
+// Leaderboard 哔咔排行榜。
+//
+// 与 JM 的「分类 × 排序 × 分页」不同，哔咔上游是「时间段 × 榜单类型」的定长列表：
+// GET /comics/leaderboard?tt={H24|D7|D30}&ct=VC，响应 data.comics[]，不分页。
+// 因此这里忽略 page/sort/tag，只认 period 与 category。
+func (bikaProvider) Leaderboard(ctx context.Context, identity string, q provider.LeaderboardQuery) (any, error) {
+	period, err := bikaLeaderboardPeriod(q.Period)
+	if err != nil {
+		return nil, err
+	}
+	ct := bikaLeaderboardCategory(q.Category)
+	key := period + ":" + ct
+	if items, ok := bikaLeaderboardCached(key); ok {
+		return items, nil
 	}
 	data, err := bikaCall(ctx, identity, func(t string) (any, error) {
-		return bikaClient.ComicsByCategory(ctx, t, category, bikaSort(sort), page)
+		return bikaClient.Leaderboard(ctx, t, period, ct)
 	})
 	if err != nil {
 		return nil, err
 	}
-	return bikaSummaries(data), nil
+	items := bikaSummaries(data)
+	bikaLeaderboardStore(key, items)
+	return copyBikaSummaries(items), nil
+}
+
+// 榜单缓存：榜单本身是「按时间段统计」的慢变量，App 端也缓存 15 分钟，
+// 这里取 10 分钟，避免用户反复切时间段时把上游打爆（哔咔对频率比较敏感）。
+const bikaLeaderboardTTL = 10 * time.Minute
+
+type bikaLeaderboardEntry struct {
+	items []v2ComicSummary
+	exp   time.Time
+}
+
+var (
+	bikaLeaderboardMu    sync.Mutex
+	bikaLeaderboardTable = map[string]bikaLeaderboardEntry{}
+)
+
+// copyBikaSummaries 复制切片。必须复制：handler 里的 v2MaskList 用 items[:0] 原地
+// 压缩来过滤条目，直接返回缓存切片会把缓存内容改写掉。
+func copyBikaSummaries(in []v2ComicSummary) []v2ComicSummary {
+	if len(in) == 0 {
+		return in
+	}
+	out := make([]v2ComicSummary, len(in))
+	copy(out, in)
+	return out
+}
+
+func bikaLeaderboardCached(key string) ([]v2ComicSummary, bool) {
+	bikaLeaderboardMu.Lock()
+	e, ok := bikaLeaderboardTable[key]
+	bikaLeaderboardMu.Unlock()
+	if !ok || time.Now().After(e.exp) {
+		return nil, false
+	}
+	return copyBikaSummaries(e.items), true
+}
+
+func bikaLeaderboardStore(key string, items []v2ComicSummary) {
+	bikaLeaderboardMu.Lock()
+	bikaLeaderboardTable[key] = bikaLeaderboardEntry{
+		items: copyBikaSummaries(items),
+		exp:   time.Now().Add(bikaLeaderboardTTL),
+	}
+	bikaLeaderboardMu.Unlock()
 }
 
 // —— 随机 / 每日精选 共用的抽取内核 ——

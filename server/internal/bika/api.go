@@ -113,14 +113,21 @@ func (c *Client) ComicsByCreator(ctx context.Context, token, creatorID, sort str
 	return c.Request(ctx, http.MethodGet, "/comics", q, nil, token)
 }
 
-// Leaderboard 排行榜：GET comics/leaderboard?tt={days}&ct=VC。days ∈ H24/D7/D30。
-func (c *Client) Leaderboard(ctx context.Context, token, days string) (any, error) {
-	if days == "" {
-		days = "H24"
+// Leaderboard 排行榜：GET comics/leaderboard?tt={tt}&ct={ct}。
+//
+// tt 为时间段（App 端 LeaderboardTimeframe：H24=24小时 / D7=7天 / D30=30天），
+// ct 为榜单类型（App 端 LeaderboardCategory 目前只有 VIEW_COUNT="VC"=浏览榜）。
+// 上游该接口不分页，一次返回固定长度的榜单；返回体为 data.comics[]。
+func (c *Client) Leaderboard(ctx context.Context, token, tt, ct string) (any, error) {
+	if tt == "" {
+		tt = "H24"
+	}
+	if ct == "" {
+		ct = "VC"
 	}
 	q := url.Values{}
-	q.Set("tt", days)
-	q.Set("ct", "VC")
+	q.Set("tt", tt)
+	q.Set("ct", ct)
 	return c.Request(ctx, http.MethodGet, "/comics/leaderboard", q, nil, token)
 }
 

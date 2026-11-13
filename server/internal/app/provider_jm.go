@@ -97,8 +97,8 @@ func (jmProvider) Search(ctx context.Context, identity, keyword string, page int
 	return out, nil
 }
 
-func (jmProvider) Leaderboard(ctx context.Context, identity, category string, page int, sort, tag string) (any, error) {
-	return v2LeaderboardItems(ctx, store.LoadCookies(identity), category, page, sort, tag)
+func (jmProvider) Leaderboard(ctx context.Context, identity string, q provider.LeaderboardQuery) (any, error) {
+	return v2LeaderboardItems(ctx, store.LoadCookies(identity), q.Category, q.Page, q.Sort, q.Tag)
 }
 
 // Random 返回随机页一次呈现的 10 本。JM 上游没有批量随机接口，这里随机挑若干
